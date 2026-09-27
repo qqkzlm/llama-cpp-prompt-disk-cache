@@ -588,6 +588,7 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    bool checkpoint_only = false;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -632,6 +633,17 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // on-disk L2, optional (set by server_context, null = disabled)
+    struct server_prompt_disk * disk = nullptr;
+
+    void set_disk(struct server_prompt_disk * d) { disk = d; }
+
+    // when true, slot-eviction saves must not write full states to the prefix-only store
+    bool disk_prefix_only = false;
+
+    // set when the entry about to be restored came from disk (for restore timing)
+    bool last_from_disk = false;
 };
 
 // used exclusively by router mode

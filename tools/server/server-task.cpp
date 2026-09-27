@@ -1,5 +1,6 @@
 #include "server-task.h"
 
+#include "server-prompt-disk.h"
 #include "build-info.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -10,6 +11,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <chrono>
 #include <sstream>
 
 //
@@ -1738,7 +1740,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->data.checkpoint_only) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1791,23 +1793,91 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // Effective reusable length: when checkpoints exist (hybrid/SWA memory), only
+    // positions covered by a checkpoint can actually be reused; otherwise the raw
+    // common prefix applies (dense models reuse KV cells directly).
+    auto best_usable_prefix = [&tokens_new](const server_prompt & cached) {
+        const int lcp = cached.tokens.get_common_prefix(tokens_new);
+        if (cached.checkpoints.empty()) {
+            return lcp;
+        }
+        int usable = 0;
+        for (const auto & checkpoint : cached.checkpoints) {
+            if (checkpoint.n_tokens <= lcp && checkpoint.n_tokens > usable) {
+                usable = (int) checkpoint.n_tokens;
+            }
+        }
+        return usable;
+    };
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const int base_eff = best_usable_prefix(prompt);
+
+    float f_keep_best = prompt.tokens.size() > 0 ? float(base_eff) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = tokens_new.size() > 0 ? float(base_eff) / tokens_new.size() : 0.0f;
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
+    int best_ram_prefix = best_usable_prefix(prompt);
+    for (const auto & state : states) {
+        best_ram_prefix = std::max(best_ram_prefix, best_usable_prefix(state.prompt));
+    }
+
+    if (disk != nullptr) {
+        std::string path;
+        int disk_prefix = 0;
+        const bool have_disk = disk->find_best(tokens_new, path, disk_prefix);
+        SRV_INF("prompt cache candidates: RAM %d / disk %d of %d tokens%s\n",
+                best_ram_prefix, disk_prefix, (int) tokens_new.size(), have_disk ? "" : " (no disk entry)");
+
+        // Load from disk only when RAM cannot provide an equal or longer usable prefix.
+        if (have_disk && disk_prefix > best_ram_prefix && disk_prefix > base_eff) {
+            server_prompt dprompt;
+            server_prompt_data ddata;
+            double ms_read = 0.0, ms_parse = 0.0;
+            const bool loaded = disk->load_entry(path, dprompt, ddata, ms_read, ms_parse);
+            bool draft_compatible = false;
+            if (loaded) {
+                if (ddata.checkpoint_only) {
+                    if (!ddata.main.empty()) {
+                        // v3 prefix entry: complete KV snapshot + token prefix.
+                        draft_compatible = (ddata.drft.empty() == (ctx_dft == nullptr));
+                    } else if (!dprompt.checkpoints.empty()) {
+                        // legacy v1/v2 partial-only entry: no full state.
+                        draft_compatible = (!dprompt.checkpoints.back().data_dft.empty() == (ctx_dft != nullptr));
+                    }
+                } else {
+                    draft_compatible = (ddata.drft.empty() == (ctx_dft == nullptr));
+                }
+            }
+            if (draft_compatible) {
+                 SRV_INF("prompt disk: selected prefix candidate %d of %d prompt tokens from %s (read %.0f ms, parse %.0f ms)\n",
+                         disk_prefix, (int) tokens_new.size(), path.c_str(), ms_read, ms_parse);
+                // Keep one hot copy in RAM.  Inserting the same state twice
+                // here used to double RAM usage and made candidate selection
+                // depend on list order.
+                states.push_back({std::move(dprompt), std::move(ddata)});
+                update();
+                last_from_disk = true;
+            }
+        } else if (have_disk && disk_prefix > 0) {
+            SRV_INF("prompt cache: kept RAM prefix %d; disk prefix %d not loaded\n",
+                    best_ram_prefix, disk_prefix);
+        }
+    }
+
     // find the most similar cached prompt, that would also preserve the most context
+    // (compare usable lengths, not raw token overlap, so stale checkpoints lose to fresh ones)
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int eff_cur = best_usable_prefix(it->prompt);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        const float f_keep_cur = float(eff_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = tokens_new.size() > 0 ? float(eff_cur) / tokens_new.size() : 0.0f;
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, usable = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, eff_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -1825,31 +1895,70 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
+        const auto t_restore = std::chrono::steady_clock::now();
 
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+        if (it_best->data.checkpoint_only) {
+            if (it_best->prompt.checkpoints.empty()) {
+                SRV_ERR("%s", "prefix-only prompt cache entry has no checkpoint\n");
 
                 return false;
             }
+            auto & pdata = it_best->data.main;
+            if (!pdata.empty()) {
+                // v3 prefix entry: full seq state at this prefix length.
+                // Restore it directly; only tokens after the fork are recomputed.
+                const size_t psize = pdata.size();
+                const size_t pn = llama_state_seq_set_data_ext(ctx_tgt, pdata.data(), psize, id_slot, 0);
+                if (pn != psize) {
+                    SRV_ERR("failed to restore prefix state with size %zu\n", psize);
+                    return false;
+                }
+                pdata.clear();
+                pdata.shrink_to_fit();
 
-            data.clear();
-            data.shrink_to_fit();
-        }
+                // A speculative/draft context is part of the complete
+                // prefix snapshot too.  Restoring only the target context
+                // makes the first generated tokens diverge when draft
+                // decoding is enabled.
+                auto & pdata_dft = it_best->data.drft;
+                if (!pdata_dft.empty()) {
+                    if (ctx_dft == nullptr) {
+                        SRV_ERR("%s", "prefix state contains draft data but draft context is unavailable\n");
+                        return false;
+                    }
+                    const size_t psize_dft = pdata_dft.size();
+                    const size_t pn_dft = llama_state_seq_set_data_ext(ctx_dft, pdata_dft.data(), psize_dft, id_slot, 0);
+                    if (pn_dft != psize_dft) {
+                        SRV_ERR("failed to restore prefix draft state with size %zu\n", psize_dft);
+                        return false;
+                    }
+                    pdata_dft.clear();
+                    pdata_dft.shrink_to_fit();
+                }
 
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+                // The complete snapshot has already restored the state at
+                // the prefix boundary.  The checkpoint metadata serialized
+                // in a prefix entry is index metadata only; it has no
+                // PARTIAL_ONLY payload.  Do not leave it attached to the
+                // prompt, otherwise the normal prompt-reuse path will try
+                // to load an empty partial checkpoint and rewind the freshly
+                // restored full state.
+                it_best->prompt.checkpoints.clear();
+            } else {
+                // Legacy partial-only entry without a complete snapshot.
+                SRV_WRN("%s", "legacy prefix-only entry without full state; recompute may be larger\n");
+                const auto & checkpoint = it_best->prompt.checkpoints.back();
+                checkpoint.load_tgt(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                checkpoint.load_dft(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        } else {
+            {
+                auto & data = it_best->data.main;
 
                 const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    SRV_ERR("failed to restore state with size %zu\n", size);
 
                     return false;
                 }
@@ -1857,12 +1966,40 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.clear();
                 data.shrink_to_fit();
             }
+
+            {
+                auto & data = it_best->data.drft;
+
+                if (!data.empty()) {
+                    GGML_ASSERT(ctx_dft);
+
+                    const size_t size = data.size();
+                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                    if (n != size) {
+                        SRV_WRN("failed to restore state with size %zu\n", size);
+
+                        return false;
+                    }
+
+                    data.clear();
+                    data.shrink_to_fit();
+                }
+            }
         }
 
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        if (last_from_disk) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_restore).count();
+            SRV_INF("prompt disk: restored %d prompt tokens to device (%.0f ms)\n",
+                    (int) prompt.tokens.size(), ms);
+        }
     }
+
+    last_from_disk = false;
 
     return true;
 }

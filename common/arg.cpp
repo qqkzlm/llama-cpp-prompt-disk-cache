@@ -3582,11 +3582,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
-        "path to save slot kv cache (default: disabled)",
+        "path to save slot kv cache (created if missing; default: disabled)",
         [](common_params & params, const std::string & value) {
             params.slot_save_path = value;
-            if (!fs_is_directory(params.slot_save_path)) {
-                throw std::invalid_argument("not a directory: " + value);
+            std::error_code ec;
+            std::filesystem::create_directories(params.slot_save_path, ec);
+            if (ec || !fs_is_directory(params.slot_save_path)) {
+                throw std::invalid_argument("cannot create slot save directory '" + value + "'" + (ec ? ": " + ec.message() : ""));
             }
             // if doesn't end with DIRECTORY_SEPARATOR, add it
             if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
@@ -3594,6 +3596,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-budget"}, "N",
+        "on-disk prompt cache budget in GiB, 0 = no limit (default: 20, needs --slot-save-path)",
+        [](common_params & params, int value) {
+            params.prompt_cache_disk_budget_gb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_BUDGET"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-min-tokens"}, "N",
+        "skip on-disk prompt cache entries shorter than this many tokens (default: 1024)",
+        [](common_params & params, int value) {
+            params.prompt_cache_disk_min_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-path"}, "PATH",
+        "on-disk prompt cache directory (default: <slot-save-path>/pdcache, needs --slot-save-path)",
+        [](common_params & params, const std::string & value) {
+            params.prompt_cache_disk_path = value;
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.prompt_cache_disk_path.empty() && params.prompt_cache_disk_path[params.prompt_cache_disk_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.prompt_cache_disk_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_PATH"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk"},
+        {"--no-prompt-cache-disk"},
+        "enable/disable the on-disk prompt cache (default: enabled)",
+        [](common_params & params, bool value) {
+            params.prompt_cache_disk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-prefix-only"},
+        {"--no-prompt-cache-disk-prefix-only"},
+        "disabled: prefix-only prompt cache is not yet safe for Bonsai/hybrid models",
+        [](common_params & params, bool value) {
+            if (value) {
+                throw std::invalid_argument("--prompt-cache-disk-prefix-only is temporarily disabled; use full prompt snapshots");
+            }
+            params.prompt_cache_disk_prefix_only = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_PREFIX_ONLY"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-prefix-tokens"}, "N",
+        "maximum prefix length stored by --prompt-cache-disk-prefix-only (default: 32768)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("prompt cache prefix token limit must be greater than zero");
+            }
+            params.prompt_cache_disk_prefix_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_PREFIX_TOKENS"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",

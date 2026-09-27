@@ -580,6 +580,104 @@ These words will not be included in the completion, so make sure to add them to 
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
+### Persistent prompt-disk cache
+
+This fork adds an optional persistent L2 prompt cache behind the normal in-memory prompt cache. It stores a complete sequence snapshot (target state, optional draft state, and prompt tokens) and can restore it after a server restart or when a single slot is switched between conversation branches.
+
+Enable it with:
+
+```sh
+llama-server \
+    --slot-save-path /path/to/slot-cache \
+    --prompt-cache-disk \
+    --prompt-cache-disk-budget 5 \
+    --checkpoint-min-step 2048 \
+    --ctx-checkpoints 64 \
+    --no-prompt-cache-disk-prefix-only
+```
+
+On Windows, use a path such as `D:\\llama-cache\\qwen`. The cache directory and its `pdcache` child are created automatically. The cache is bound to the model fingerprint, context size, Flash Attention setting, KV types, and build identity; incompatible entries are ignored.
+
+#### Full snapshots are the supported mode
+
+For hybrid models with recurrent or SWA state, a reusable prefix must include the complete sequence state, not only a `PARTIAL_ONLY` checkpoint. Therefore the supported mode is the default full-prompt snapshot mode:
+
+- the complete prompt tokens are stored;
+- the complete target sequence state is stored;
+- the complete draft sequence state is stored when draft decoding is enabled;
+- the checkpoint metadata is stored so the hybrid state can select a safe restore boundary;
+- after a branch, only the tokens after the selected checkpoint are evaluated again.
+
+`--prompt-cache-disk-prefix-only` is intentionally disabled by this fork. Enabling it returns an error because the former partial-checkpoint implementation can report a cache hit while producing a different continuation on hybrid models. It will remain disabled until a non-blocking, correctness-verified implementation is available.
+
+#### Switching between two conversations with one slot
+
+With `-np 1`, conversation A and conversation B share one runtime slot. When a new request branches from the prompt currently held by the slot, the server now:
+
+1. saves the current slot as a complete disk snapshot;
+2. searches RAM and disk for the best compatible snapshot for the new request;
+3. restores the longer usable prefix when one exists;
+4. evaluates only the suffix after that prefix;
+5. keeps the new conversation available for the next switch.
+
+This branch-save decision is independent of the old `f_keep < 0.5` heuristic. A request that still shares 60% or more of the old prompt can nevertheless be a different conversation branch and must be persisted before the slot is reused.
+
+The cache lookup log now exposes the decision explicitly:
+
+```text
+prompt request: ... branch_switch=1 save_previous_slot=1 disk_lookup=1
+prompt cache candidates: RAM 2048 / disk 9124 of 9132 tokens
+prompt disk: selected prefix candidate 9124 ...
+prompt disk: restored 9136 prompt tokens to device (28 ms)
+```
+
+`prompt cache = total / reused / recomputed` is the final request-level statistic. `reused` means the restored or in-memory state was accepted by the prompt processing path; it is not a substitute for a cold-run output comparison when validating a new model architecture.
+
+#### Choosing checkpoint spacing
+
+`--checkpoint-min-step N` controls the minimum spacing between usable hybrid checkpoints. Smaller values can reduce suffix recomputation after a conversation branch, but increase checkpoint metadata and state-management overhead. A practical starting point is `2048`; use `4096` when disk and memory pressure matter more than branch-switch latency.
+
+`--ctx-checkpoints N` limits the number of in-memory checkpoints. It does not change the complete snapshot size. A complete Qwen/Bonsai snapshot can be hundreds of MiB, so leave several GiB of free space in addition to the configured cache budget. The budget is only an eviction limit; it cannot compensate for insufficient free space on the filesystem.
+
+#### Troubleshooting
+
+- `disk_lookup=0` on a request that is a branch switch: verify that the request uses `cache_prompt: true` and that the running binary contains the branch-switch fix.
+- `prompt disk: failed writing ... .centry.tmp`: check free disk space and remove stale `.tmp` files after stopping the server.
+- A large `recomputed` count: compare the RAM/disk candidate line with the final cache line. Hybrid models can only restore at a complete checkpoint boundary, so the usable prefix can be shorter than the raw token LCP.
+- Never treat `prompt disk: selected prefix candidate` alone as proof of a successful restore. The corresponding `restored ... prompt tokens to device` line and an output comparison are required.
+
+#### Recent Qwen 3.6 validation log
+
+The following measurements were collected with `Qwen3.6-35B-A3B-NVFP4-Q4_K_M.gguf`, one slot, 32K context, `--checkpoint-min-step 2048`, `--ctx-checkpoints 64`, full snapshots, and prefix-only disabled. They document the expected meaning of the current server log fields.
+
+| Request | Input | Reused | Recomputed | Prompt speed | Output | Output speed | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| cold prompt (`task 14`) | 9128 | 0 | 9128 | 283.13 tok/s | 9 | 28.93 tok/s | 32.516 s |
+| RAM branch reuse (`task 31`) | 9132 | 2048 | 7084 | 281.59 tok/s | 9 | 29.24 tok/s | 25.430 s |
+| disk restore after restart (`task 0`) | 9128 | 9124 | 4 | 23.50 tok/s for 4 tokens | 9 | 19.05 tok/s | 0.590 s |
+| branch with 4096 checkpoint (`task 26`) | 9130 | 4096 | 5034 | 279.72 tok/s | 9 | 28.64 tok/s | 18.276 s |
+| near-identical branch (`task 41`) | 9149 | 9126 | 23 | 75.98 tok/s for 23 tokens | 13 | 28.27 tok/s | 0.727 s |
+
+The corresponding detailed lines were:
+
+```text
+prompt disk: selected prefix candidate 9124 of 9128 prompt tokens ...
+prompt disk: restored 9136 prompt tokens to device (28 ms)
+prompt cache = 9128 total / 9124 reused / 4 recomputed
+total time = 590.22 ms / 13 tokens
+```
+
+and, for a branch whose nearest usable checkpoint was 4096 tokens:
+
+```text
+prompt cache = 9130 total / 4096 reused / 5034 recomputed
+prompt eval time = 17996.41 ms / 5034 tokens / 279.72 tokens per second
+eval time = 279.33 ms / 9 tokens / 28.64 tokens per second
+total time = 18275.74 ms / 5043 tokens
+```
+
+Before the branch-switch fix, the same one-slot A/B pattern produced `cache_lookup=0` whenever `f_keep` was about `0.64`. The old slot was then overwritten, disk lookup was skipped, and the disk write often failed because the filesystem had only about 50 MiB free while each complete snapshot was approximately 346--409 MiB. The fixed log separates the decisions into `branch_switch`, `save_previous_slot`, and `disk_lookup`; the cache directory must also have enough physical free space for at least one new snapshot.
+
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.

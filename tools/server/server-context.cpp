@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-prompt-disk.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -271,6 +272,10 @@ struct server_slot {
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        if (prompt_cache.disk != nullptr && !prompt_cache.disk_prefix_only) {
+            prompt_cache.disk->store(prompt.tokens, prompt.checkpoints, cur->data.main, cur->data.drft);
         }
 
         return true;
@@ -598,6 +603,12 @@ struct server_slot {
                 t_prompt_total, (int) stats.n_prompt_processed, t_prompt, n_prompt_second);
 
         SLT_INF(*this,
+                "prompt cache = %5d total / %5d reused / %5d recomputed (%.2f ms recompute, %.2f tok/s)\n",
+                (int) (stats.n_prompt_cached + stats.n_prompt_processed),
+                (int) stats.n_prompt_cached, (int) stats.n_prompt_processed, t_prompt_total,
+                t_prompt_total > 0 ? stats.n_prompt_processed / (t_prompt_total / 1e3) : 0.0);
+
+        SLT_INF(*this,
                 "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
                 t_gen_total, (int) stats.n_gen, t_gen, n_gen_second);
 
@@ -865,6 +876,9 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // on-disk L2 for the prompt cache, empty dir = disabled
+    std::unique_ptr<server_prompt_disk> prompt_disk;
 
     server_metrics metrics;
 
@@ -1278,6 +1292,46 @@ private:
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
+
+        if (params_base.prompt_cache_disk && prompt_cache) {
+            std::string disk_dir;
+            if (!params_base.prompt_cache_disk_path.empty()) {
+                disk_dir = params_base.prompt_cache_disk_path;
+            } else if (!params_base.slot_save_path.empty()) {
+                disk_dir = params_base.slot_save_path + "pdcache" + std::string(1, DIRECTORY_SEPARATOR);
+            } else {
+                disk_dir = std::string(".") + std::string(1, DIRECTORY_SEPARATOR) + "pdcache" + std::string(1, DIRECTORY_SEPARATOR);
+            }
+            if (params_base.prompt_cache_disk_prefix_only) {
+                disk_dir += "prefix-only" + std::string(1, DIRECTORY_SEPARATOR);
+            }
+            if (!disk_dir.empty()) {
+                // on-disk L2 for the prompt cache
+                std::error_code ec;
+                std::filesystem::create_directories(disk_dir, ec);
+                if (ec || !std::filesystem::is_directory(disk_dir, ec)) {
+                    throw std::runtime_error(string_format("cannot create prompt cache directory '%s': %s",
+                            disk_dir.c_str(), ec ? ec.message().c_str() : "path is not a directory"));
+                }
+                server_prompt_disk_guard guard;
+                guard.model_fingerprint = server_prompt_file_fingerprint(params_base.model.path);
+                guard.legacy_model_path = params_base.model.path;
+                guard.n_ctx = n_ctx;
+                guard.flash_attn = (int32_t) params_base.flash_attn_type;
+                guard.cache_k = (int32_t) params_base.cache_type_k;
+                guard.cache_v = (int32_t) params_base.cache_type_v;
+                guard.build = string_format("%s/%d", llama_commit(), llama_build_number());
+                prompt_disk = std::make_unique<server_prompt_disk>(
+                    disk_dir,
+                    (uint64_t) params_base.prompt_cache_disk_budget_gb * 1024ull * 1024ull * 1024ull,
+                    (size_t) params_base.prompt_cache_disk_min_tokens,
+                    guard);
+                prompt_disk->scan();
+                prompt_cache->set_disk(prompt_disk.get());
+                prompt_cache->disk_prefix_only = params_base.prompt_cache_disk_prefix_only;
+                SRV_INF("prompt disk cache enabled: %s\n", disk_dir.c_str());
+            }
+        }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -1455,6 +1509,7 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool branch_switch = false;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1541,12 +1596,30 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const size_t ret_lcp = ret->prompt.tokens.get_common_prefix(task.tokens);
+            // With a single slot, switching from one conversation branch to
+            // another must first preserve the current slot.  The old
+            // f_keep < 0.5 heuristic missed branches that still shared a
+            // large prefix (for example f_keep ~= 0.64), so the previous
+            // conversation was overwritten without a disk snapshot.
+            branch_switch = !ret->prompt.tokens.empty() && ret_lcp < ret->prompt.tokens.size();
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            if (task.id_slot != -1 && ret->prompt.tokens.empty()) {
+                // A pinned empty slot must still consult the host prompt cache.
+                update_cache = true;
+            }
 
-            if (update_cache) {
+            const auto request_tokens = task.tokens.get_text_tokens();
+            const bool can_lookup_cache = prompt_cache != nullptr && task.params.cache_prompt &&
+                    task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool save_previous_slot = update_cache || branch_switch;
+            const bool lookup_cache = can_lookup_cache && (save_previous_slot || ret->prompt.tokens.empty());
+            SRV_INF("prompt request: task %d slot %d pinned=%d slot_tokens=%zu input_tokens=%zu token_hash=%016llx branch_switch=%d save_previous_slot=%d disk_lookup=%d\n",
+                    task.id, ret->id, task.id_slot != -1, ret->prompt.tokens.size(), request_tokens.size(),
+                    (unsigned long long) server_prompt_disk_hash(request_tokens), branch_switch,
+                    save_previous_slot, lookup_cache);
+
+            if (save_previous_slot && can_lookup_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
@@ -1560,6 +1633,17 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // A branch switch needs the L2 lookup even when the old slot was
+            // not considered sufficiently dissimilar by f_keep.  This is the
+            // path that restores conversation A after conversation B replaced
+            // the only RAM slot.
+            if (lookup_cache && save_previous_slot) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    ret->prompt_clear();
+                }
+                prompt_cache->update();
             }
         }
 
@@ -2249,10 +2333,53 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        if (params_base.prompt_cache_disk_prefix_only && prompt_disk) {
+            // Prefix-only must still store a COMPLETE restorable state at this
+            // prefix length: token prefix + full seq KV. The incremental
+            // checkpoint above (PARTIAL_ONLY) is kept for in-RAM rewind, but
+            // disk reuse restores from the full snapshot below and recomputes
+            // only tokens after the fork point.
+            const size_t full_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t full_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+            std::vector<uint8_t> data_tgt(full_tgt), data_dft(full_dft);
+            if (full_tgt) {
+                llama_state_seq_get_data_ext(ctx_tgt, data_tgt.data(), full_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+            if (full_dft) {
+                llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), full_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+            prompt_disk->store_prefix_checkpoint(slot.prompt.tokens, cur,
+                    (size_t) params_base.prompt_cache_disk_prefix_tokens, data_tgt, data_dft);
+        }
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // persist a finished slot to the on-disk prompt cache (async write, dedup by hash)
+    void prompt_disk_save(server_slot & slot) {
+        if (!prompt_disk) {
+            return;
+        }
+        // prefix-only mode stores per-checkpoint entries at creation time instead
+        if (params_base.prompt_cache_disk_prefix_only) {
+            return;
+        }
+        if (slot.prompt.tokens.size() == 0 || slot.prompt.checkpoints.empty()) {
+            return;
+        }
+        const size_t size_tgt = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        std::vector<uint8_t> data_tgt(size_tgt), data_dft(size_dft);
+        if (size_tgt) {
+            llama_state_seq_get_data_ext(slot.ctx_tgt, data_tgt.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        if (size_dft) {
+            llama_state_seq_get_data_ext(slot.ctx_dft, data_dft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+        prompt_disk->store(slot.prompt.tokens, slot.prompt.checkpoints, data_tgt, data_dft);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2463,6 +2590,41 @@ private:
                         break;
                     }
 
+                    // save context checkpoints to a sidecar file, restore needs them for cache reuse
+                    {
+                        const std::string ckpt_path = filepath + ".ckpt";
+                        std::ofstream f(ckpt_path, std::ios::binary | std::ios::trunc);
+                        const auto wr = [&f](const void * p, size_t n) { f.write((const char *) p, n); };
+                        const uint32_t magic = 0x434b5054; // "CKPT"
+                        const uint32_t ver = 2;
+                        const std::string & mpath = params_base.model.path;
+                        const uint64_t mlen = mpath.size();
+                        const auto nctx = slot->n_ctx;
+                        const uint64_t nckpt = slot->prompt.checkpoints.size();
+                        const uint64_t thash = server_prompt_disk_hash(slot->prompt.tokens.get_text_tokens());
+                        wr(&magic, sizeof(magic)); wr(&ver, sizeof(ver));
+                        wr(&thash, sizeof(thash));
+                        wr(&mlen, sizeof(mlen)); f.write(mpath.data(), mlen);
+                        wr(&nctx, sizeof(nctx)); wr(&nckpt, sizeof(nckpt));
+                        for (const auto & ckpt : slot->prompt.checkpoints) {
+                            const auto nt = ckpt.n_tokens;
+                            const auto it = ckpt.id_task;
+                            const auto p0 = ckpt.pos_min;
+                            const auto p1 = ckpt.pos_max;
+                            wr(&nt, sizeof(nt)); wr(&it, sizeof(it));
+                            wr(&p0, sizeof(p0)); wr(&p1, sizeof(p1));
+                            for (const auto * b : {&ckpt.data_tgt, &ckpt.data_dft, &ckpt.data_spec}) {
+                                const uint64_t bl = b->size();
+                                wr(&bl, sizeof(bl));
+                                if (bl) { f.write((const char *) b->data(), bl); }
+                            }
+                        }
+                        f.close();
+                        if (!f) {
+                            SLT_WRN((*slot), "failed to write checkpoint sidecar %s\n", ckpt_path.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2522,6 +2684,74 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // rebuild context checkpoints from the sidecar file, reuse needs them
+                        {
+                            const std::string ckpt_path = filepath + ".ckpt";
+                            std::ifstream f(ckpt_path, std::ios::binary);
+                            const auto rd = [&f](void * p, size_t n) { f.read((char *) p, n); return (bool) f; };
+                            bool ok = (bool) f;
+                            uint32_t magic = 0, ver = 0;
+                            uint64_t mlen = 0, nckpt = 0, thash = 0;
+                            decltype(slot->n_ctx) nctx = 0;
+                            ok = ok && rd(&magic, sizeof(magic)) && rd(&ver, sizeof(ver));
+                            ok = ok && magic == 0x434b5054 && (ver == 1 || ver == 2);
+                            if (ok && ver == 2) {
+                                ok = rd(&thash, sizeof(thash));
+                            } else if (ok) {
+                                SLT_WRN((*slot), "%s", "checkpoint sidecar has no content hash (v1), skipping the check\n");
+                            }
+                            std::string mpath;
+                            if (ok && rd(&mlen, sizeof(mlen)) && mlen < 65536) {
+                                mpath.resize(mlen);
+                                ok = mlen == 0 || rd(mpath.data(), mlen);
+                            } else {
+                                ok = false;
+                            }
+                            ok = ok && rd(&nctx, sizeof(nctx)) && rd(&nckpt, sizeof(nckpt));
+                            ok = ok && mpath == params_base.model.path && nctx == slot->n_ctx && nckpt <= 4096;
+                            if (ok && ver == 2) {
+                                // content binding: the checkpoints must belong to these exact tokens
+                                const uint64_t thash_cur = server_prompt_disk_hash(slot->prompt.tokens.get_text_tokens());
+                                if (thash_cur != thash) {
+                                    SLT_WRN((*slot), "%s", "checkpoint sidecar content hash mismatch, ignoring\n");
+                                    ok = false;
+                                }
+                            }
+                            std::list<common_prompt_checkpoint> ckpts;
+                            for (uint64_t i = 0; ok && i < nckpt; i++) {
+                                common_prompt_checkpoint ckpt;
+                                ok = rd(&ckpt.n_tokens, sizeof(ckpt.n_tokens))
+                                  && rd(&ckpt.id_task, sizeof(ckpt.id_task))
+                                  && rd(&ckpt.pos_min, sizeof(ckpt.pos_min))
+                                  && rd(&ckpt.pos_max, sizeof(ckpt.pos_max));
+                                for (auto * b : {&ckpt.data_tgt, &ckpt.data_dft, &ckpt.data_spec}) {
+                                    uint64_t bl = 0;
+                                    ok = ok && rd(&bl, sizeof(bl)) && bl <= (uint64_t) 32 * 1024 * 1024 * 1024;
+                                    if (ok && bl) {
+                                        b->resize(bl);
+                                        ok = rd(b->data(), bl);
+                                    }
+                                    if (!ok) {
+                                        break;
+                                    }
+                                }
+                                if (ok) {
+                                    ckpts.push_back(std::move(ckpt));
+                                }
+                            }
+                            if (ok) {
+                                slot->prompt.checkpoints = std::move(ckpts);
+                                size_t total = 0;
+                                for (const auto & c : slot->prompt.checkpoints) {
+                                    total += c.size();
+                                }
+                                SLT_TRC((*slot), "restored %d context checkpoint(s) from sidecar %s (%.3f MiB)\n",
+                                        (int) slot->prompt.checkpoints.size(), ckpt_path.c_str(), (float) total / 1024 / 1024);
+                            } else {
+                                SLT_WRN((*slot), "ignoring invalid checkpoint sidecar %s\n", ckpt_path.c_str());
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3405,7 +3635,11 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    const size_t checkpoint_batch_limit = params_base.prompt_cache_disk_prefix_only
+                            ? (size_t) std::max(1, params_base.checkpoint_min_step)
+                            : (size_t) n_batch;
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch
+                            && batch.size() - n_tokens_prev < checkpoint_batch_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3472,6 +3706,10 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    const auto & checkpoints = slot.prompt.checkpoints;
+                    const bool checkpoint_spacing_due = checkpoints.empty() || params_base.checkpoint_min_step == 0 ||
+                            n_tokens_start >= checkpoints.back().n_tokens + params_base.checkpoint_min_step;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -3486,9 +3724,8 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // Keep checkpoints at the configured spacing during long prompt prefills.
+                        if (!is_user_start && !near_prompt_end && !checkpoint_spacing_due) {
                             do_checkpoint = false;
                         }
                     }
@@ -3508,6 +3745,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
+                            checkpoint_spacing_due ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
@@ -3770,6 +4008,7 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                prompt_disk_save(slot);
                 slot.release();
 
                 return;
