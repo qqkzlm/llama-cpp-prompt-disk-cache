@@ -1,4 +1,37 @@
-# llama.cpp
+# llama.cpp + Persistent Prompt Disk Cache
+
+> [!NOTE]
+> **This repo's purpose: an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.**
+>
+> Long agentic sessions re-send the same growing conversation on every request. This patch
+> makes the server **persist the KV-cache prefix to disk and restore it automatically**, so a
+> restart (or a new process on the same prompt) skips the prefill it has already paid for.
+>
+> ```bash
+> llama-server -m model.gguf -c 32768 \
+>   --slot-save-path D:/kvstore/mymodel \    # checkpoint directory (pdcache)
+>   --checkpoint-min-step 4096 \              # save granularity: every 4096 tokens of growth
+>   --ctx-checkpoints 64 \                    # max checkpoints kept in RAM
+>   --prompt-cache-disk-budget 20             # disk budget in GB
+> ```
+>
+> What you get:
+> - **Session restore across restarts** — on boot the newest checkpoint for the matching
+>   prompt is loaded back into the KV cache automatically.
+> - **Incremental prefix saves** — as a long conversation grows past `--checkpoint-min-step`,
+>   a new `.centry` snapshot is written; the next request reuses the longest cached prefix.
+> - **Config-signature safety** — checkpoints are keyed by model + context + KV quant; entries
+>   from a different configuration are ignored instead of corrupted.
+> - **Disk budget** — old entries are evicted once `--prompt-cache-disk-budget` is exceeded.
+>
+> Implementation lives in `tools/server/server-prompt-disk.cpp` (~900 lines) plus slot/task
+> integration; see [tools/server/README.md](tools/server/README.md) for the full flag
+> reference. The patch is a single commit on top of the PrismML `prism` branch — grab it from
+> [Releases](../../releases) or `main...prism-persistent-prompt-cache`.
+>
+> Real-world data point (GTX 1080 8 GB, 27B model, agentic re-edits of a 3k-token codebase):
+> cold restart prefill of a ~10k-token session prefix dropped from minutes to seconds after
+> restore; session prefill cost is paid once per conversation instead of once per request.
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
