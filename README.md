@@ -29,9 +29,19 @@
 > reference. The patch is a single commit on top of the PrismML `prism` branch — grab it from
 > [Releases](../../releases) or `main...prism-persistent-prompt-cache`.
 >
-> Real-world data point (GTX 1080 8 GB, 27B model, agentic re-edits of a 3k-token codebase):
-> cold restart prefill of a ~10k-token session prefix dropped from minutes to seconds after
-> restore; session prefill cost is paid once per conversation instead of once per request.
+> Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt:
+>
+> | | Cold (no cache) | Full prefix hit |
+> |---|---|---|
+> | Prefill 40K | ~151 s (265 tok/s) | 1.35 s (32 tokens recomputed) |
+> | Decode | 24–28 tok/s | 22–28 tok/s sustained over 265 tokens |
+> | End-to-end | ~155 s | ~6 s |
+> | Disk cost | 1.5 s write | 2.1 s read+parse+restore (first request after restart only) |
+>
+> MoE layering lesson from the same box: keep experts on GPU (`-ncmoe 0` + `--fit`),
+> let KV follow the layers (no `--no-kv-offload` for hybrid models — only 10 of 40
+> layers carry KV). Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and
+> decode to 4 tok/s. `--prompt-cache-disk-prefix-only` stays off for hybrid models.
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
