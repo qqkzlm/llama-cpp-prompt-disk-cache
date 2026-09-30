@@ -29,19 +29,21 @@
 > reference. The patch is a single commit on top of the PrismML `prism` branch — grab it from
 > [Releases](../../releases) or `main...prism-persistent-prompt-cache`.
 >
-> Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt:
+> 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
 >
-> | | Cold (no cache) | Full prefix hit |
+> | | 冷算 Cold (no cache) | 命中 Full prefix hit |
 > |---|---|---|
-> | Prefill 40K | ~151 s (265 tok/s) | 1.35 s (32 tokens recomputed) |
-> | Decode | 24–28 tok/s | 22–28 tok/s sustained over 265 tokens |
-> | End-to-end | ~155 s | ~6 s |
-> | Disk cost | 1.5 s write | 2.1 s read+parse+restore (first request after restart only) |
+> | 预填充 Prefill 40K | ~151 s (265 tok/s) | 1.35 s (仅重算32个token / 32 tokens recomputed) |
+> | 解码 Decode | 24–28 tok/s | 22–28 tok/s（265个token全程稳定 / sustained over 265 tokens） |
+> | 端到端 End-to-end | ~155 s | ~6 s |
+> | 磁盘开销 Disk cost | 1.5 s 写入/write | 2.1 s 读取+解析+恢复（仅重启后首次 / first request after restart only）|
 >
-> MoE layering lesson from the same box: keep experts on GPU (`-ncmoe 0` + `--fit`),
-> let KV follow the layers (no `--no-kv-offload` for hybrid models — only 10 of 40
-> layers carry KV). Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and
-> decode to 4 tok/s. `--prompt-cache-disk-prefix-only` stays off for hybrid models.
+> MoE分层经验 / MoE layering lesson（同一台机器 / same box）: 专家留GPU，KV跟层走。
+> Keep experts on GPU (`-ncmoe 0` + `--fit`), let KV follow the layers (hybrid模型不要加
+> `--no-kv-offload` — 40层里只有10层带KV / only 10 of 40 layers carry KV)。
+> 把20层MoE搬去CPU会直接崩：预填充掉到30 tok/s，解码掉到4 tok/s。
+> Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to 4 tok/s.
+> 混合模型禁用prefix-only / `--prompt-cache-disk-prefix-only` stays off for hybrid models.
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
