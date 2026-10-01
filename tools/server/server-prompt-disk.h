@@ -3,6 +3,7 @@
 #include "server-task.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -51,24 +52,26 @@ struct server_prompt_disk {
     // scan dir, index headers + token lists (blobs stay on disk until load)
     void scan();
 
-    // copy entry and queue a background write. drops exact duplicates. thread-safe.
+    // move entry into the background-write queue. drops exact duplicates. thread-safe.
+    // data vectors are taken by value: pass std::move()d locals to avoid a copy.
     void store(
         const server_tokens & tokens,
         const std::list<common_prompt_checkpoint> & checkpoints,
-        const std::vector<uint8_t> & data_main,
-        const std::vector<uint8_t> & data_drft) const;
+        std::vector<uint8_t> data_main,
+        std::vector<uint8_t> data_drft) const;
 
     void store_prefix_checkpoint(
         const server_tokens & tokens,
         const common_prompt_checkpoint & checkpoint,
         size_t prefix_limit,
-        const std::vector<uint8_t> & data_main,
-        const std::vector<uint8_t> & data_drft) const;
+        std::vector<uint8_t> data_main,
+        std::vector<uint8_t> data_drft) const;
 
     // longest-prefix match over the index. returns false on miss.
     bool find_best(const server_tokens & query, std::string & out_path, int & out_lcp) const;
 
-    // read the whole file (ms_read), then parse it (ms_parse)
+    // stream-parse the file: metadata via small reads, blobs straight
+    // into their destinations (ms_parse = header/meta, ms_read = blobs)
     bool load_entry(
         const std::string & path,
         server_prompt & prompt_out,
@@ -89,6 +92,7 @@ private:
         bool has_full_state = false; // true = data_main holds a complete restorable seq state
         uint32_t format_version = 0;
         uint64_t bytes = 0;
+        std::filesystem::file_time_type mtime = std::filesystem::file_time_type::min();
     };
 
     struct queue_item {

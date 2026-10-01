@@ -12,6 +12,15 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -228,6 +237,12 @@ void server_prompt_disk::scan() {
             continue;
         }
         const auto path = de.path().string();
+        if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".tmp") == 0) {
+            // leftover from a crashed write: never counted in the budget, remove it
+            std::error_code ec_tmp;
+            fs::remove(path, ec_tmp);
+            continue;
+        }
         if (path.size() < 7 || path.compare(path.size() - 7, 7, ".centry") != 0) {
             continue;
         }
@@ -331,6 +346,8 @@ void server_prompt_disk::scan() {
         index.push_back(std::move(e));
         std::error_code ec2;
         index.back().bytes = fs::file_size(path, ec2);
+        std::error_code ec3;
+        index.back().mtime = fs::last_write_time(path, ec3);
         index_bytes += index.back().bytes;
     }
 
@@ -341,16 +358,16 @@ void server_prompt_disk::scan() {
 void server_prompt_disk::store(
         const server_tokens & tokens,
         const std::list<common_prompt_checkpoint> & checkpoints,
-        const std::vector<uint8_t> & data_main,
-        const std::vector<uint8_t> & data_drft) const {
+        std::vector<uint8_t> data_main,
+        std::vector<uint8_t> data_drft) const {
     if (tokens.size() < min_tokens || checkpoints.empty()) {
         return;
     }
     queue_item item;
     item.tokens = tokens.get_text_tokens();
     item.checkpoints = checkpoints;
-    item.data_main = data_main;
-    item.data_drft = data_drft;
+    item.data_main = std::move(data_main);
+    item.data_drft = std::move(data_drft);
     {
         std::lock_guard<std::mutex> lock(mutex);
         if (queue.size() > 4) {
@@ -366,8 +383,8 @@ void server_prompt_disk::store_prefix_checkpoint(
         const server_tokens & tokens,
         const common_prompt_checkpoint & checkpoint,
         size_t prefix_limit,
-        const std::vector<uint8_t> & data_main,
-        const std::vector<uint8_t> & data_drft) const {
+        std::vector<uint8_t> data_main,
+        std::vector<uint8_t> data_drft) const {
     if (tokens.has_mtmd || checkpoint.n_tokens < (int64_t) min_tokens
             || checkpoint.n_tokens > (int64_t) prefix_limit) {
         return;
@@ -396,8 +413,8 @@ void server_prompt_disk::store_prefix_checkpoint(
     prefix_checkpoint.data_dft.clear();
     prefix_checkpoint.data_spec.clear();
     item.checkpoints.push_back(std::move(prefix_checkpoint));
-    item.data_main = data_main;
-    item.data_drft = data_drft;
+    item.data_main = std::move(data_main);
+    item.data_drft = std::move(data_drft);
     item.checkpoint_only = true;
 
     {
@@ -469,72 +486,6 @@ bool server_prompt_disk::find_best(const server_tokens & query, std::string & ou
     return found;
 }
 
-struct mem_reader {
-    const uint8_t * p;
-    const uint8_t * end;
-
-    bool read(void * dst, size_t n) {
-        if (dst == nullptr && n > 0) {
-            return false;
-        }
-        if ((size_t) (end - p) < n) {
-            return false;
-        }
-        if (n) {
-            memcpy(dst, p, n);
-            p += n;
-        }
-        return true;
-    }
-
-    bool read_str(std::string & s) {
-        uint64_t n = 0;
-        if (!read(&n, sizeof(n)) || n > 1 * 1024 * 1024) {
-            return false;
-        }
-        if ((size_t) (end - p) < n) {
-            return false;
-        }
-        s.assign((const char *) p, (size_t) n);
-        p += n;
-        return true;
-    }
-};
-
-static bool read_entry_head_mem(
-        mem_reader & r,
-        server_prompt_disk_guard & guard_out,
-        int32_t & n_ctx_out,
-        llama_tokens & tokens_out,
-        uint32_t & version_out) {
-    uint32_t magic = 0, ver = 0;
-    if (!r.read(&magic, sizeof(magic)) || !r.read(&ver, sizeof(ver))) {
-        return false;
-    }
-    if (magic != PDC_MAGIC || (ver != 1 && ver != 2 && ver != PDC_VER)) {
-        return false;
-    }
-    version_out = ver;
-    if (!r.read_str(guard_out.model_fingerprint)) {
-        return false;
-    }
-    if (!r.read(&n_ctx_out, sizeof(n_ctx_out))
-            || !r.read(&guard_out.flash_attn, sizeof(guard_out.flash_attn))
-            || !r.read(&guard_out.cache_k, sizeof(guard_out.cache_k))
-            || !r.read(&guard_out.cache_v, sizeof(guard_out.cache_v))) {
-        return false;
-    }
-    if (!r.read_str(guard_out.build)) {
-        return false;
-    }
-    uint64_t n = 0;
-    if (!r.read(&n, sizeof(n)) || n > (uint64_t) 4 * 1024 * 1024) {
-        return false;
-    }
-    tokens_out.resize((size_t) n);
-    return n == 0 || r.read(tokens_out.data(), n * sizeof(int32_t));
-}
-
 bool server_prompt_disk::load_entry(
         const std::string & path,
         server_prompt & prompt_out,
@@ -544,32 +495,22 @@ bool server_prompt_disk::load_entry(
     ms_read = 0.0;
     ms_parse = 0.0;
 
-    std::vector<uint8_t> buf;
-    {
-        const auto t0 = std::chrono::steady_clock::now();
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
-        if (!f) {
-            return false;
-        }
-        const auto size = f.tellg();
-        if (size < 0 || (uint64_t) size > (uint64_t) 128 * 1024 * 1024 * 1024) {
-            return false;
-        }
-        buf.resize((size_t) size);
-        f.seekg(0, std::ios::beg);
-        if (size && !f.read((char *) buf.data(), size)) {
-            return false;
-        }
-        ms_read = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
     }
+    // large stream buffer: header/checkpoint small reads stay cheap,
+    // blob reads stay sequential. blobs are read directly into their
+    // destination vectors (no whole-file staging copy).
+    std::vector<char> io_buf(4 * 1024 * 1024);
+    f.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
 
-    const auto t1 = std::chrono::steady_clock::now();
-    mem_reader r{buf.data(), buf.data() + buf.size()};
+    const auto t_parse0 = std::chrono::steady_clock::now();
     server_prompt_disk_guard g;
     int32_t n_ctx = 0;
     uint32_t version = 0;
     llama_tokens tokens;
-    if (!read_entry_head_mem(r, g, n_ctx, tokens, version)) {
+    if (!read_entry_head(f, g, n_ctx, tokens, version)) {
         return false;
     }
     if (!guard_same(g, guard, version) || (int64_t) tokens.size() > guard.n_ctx) {
@@ -577,26 +518,26 @@ bool server_prompt_disk::load_entry(
         return false;
     }
     uint64_t nckpt = 0;
-    if (!r.read(&nckpt, sizeof(nckpt)) || nckpt > 4096) {
+    if (!rd(f, &nckpt, sizeof(nckpt)) || nckpt > 4096) {
         return false;
     }
     std::list<common_prompt_checkpoint> ckpts;
     for (uint64_t i = 0; i < nckpt; i++) {
         common_prompt_checkpoint ckpt;
-        if (!r.read(&ckpt.n_tokens, sizeof(ckpt.n_tokens))
-                || !r.read(&ckpt.id_task, sizeof(ckpt.id_task))
-                || !r.read(&ckpt.pos_min, sizeof(ckpt.pos_min))
-                || !r.read(&ckpt.pos_max, sizeof(ckpt.pos_max))) {
+        if (!rd(f, &ckpt.n_tokens, sizeof(ckpt.n_tokens))
+                || !rd(f, &ckpt.id_task, sizeof(ckpt.id_task))
+                || !rd(f, &ckpt.pos_min, sizeof(ckpt.pos_min))
+                || !rd(f, &ckpt.pos_max, sizeof(ckpt.pos_max))) {
             return false;
         }
         for (auto * b : {&ckpt.data_tgt, &ckpt.data_dft, &ckpt.data_spec}) {
             uint64_t bl = 0;
-            if (!r.read(&bl, sizeof(bl)) || bl > (uint64_t) 32 * 1024 * 1024 * 1024) {
+            if (!rd(f, &bl, sizeof(bl)) || bl > (uint64_t) 32 * 1024 * 1024 * 1024) {
                 return false;
             }
             if (bl) {
                 b->resize((size_t) bl);
-                if (!r.read(b->data(), bl)) {
+                if (!f.read((char *) b->data(), bl)) {
                     return false;
                 }
             }
@@ -607,19 +548,24 @@ bool server_prompt_disk::load_entry(
     bool is_prefix = false;
     if (version >= 3) {
         uint8_t prefix_flag = 0;
-        if (!r.read(&prefix_flag, sizeof(prefix_flag))) {
+        if (!rd(f, &prefix_flag, sizeof(prefix_flag))) {
             return false;
         }
         is_prefix = prefix_flag != 0;
     }
-    if (!r.read(&lmain, sizeof(lmain)) || lmain > (uint64_t) 64 * 1024 * 1024 * 1024) {
+    if (!rd(f, &lmain, sizeof(lmain)) || lmain > (uint64_t) 64 * 1024 * 1024 * 1024) {
         return false;
     }
+    ms_parse = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_parse0).count();
+    // file order is: lmain | main blob | ldrft | drft blob.
+    // read each blob straight into its destination vector (zero-copy).
+    const auto t_read0 = std::chrono::steady_clock::now();
     data_out.main.resize((size_t) lmain);
-    if (lmain && !r.read(data_out.main.data(), (size_t) lmain)) {
+    if (lmain && !f.read((char *) data_out.main.data(), lmain)) {
         return false;
     }
-    if (!r.read(&ldrft, sizeof(ldrft)) || ldrft > (uint64_t) 64 * 1024 * 1024 * 1024) {
+    if (!rd(f, &ldrft, sizeof(ldrft)) || ldrft > (uint64_t) 64 * 1024 * 1024 * 1024) {
         return false;
     }
     if (version >= 3) {
@@ -634,9 +580,11 @@ bool server_prompt_disk::load_entry(
         SRV_WRN("prompt disk: legacy partial-only entry %s has no full state\n", path.c_str());
     }
     data_out.drft.resize((size_t) ldrft);
-    if (ldrft && !r.read(data_out.drft.data(), (size_t) ldrft)) {
+    if (ldrft && !f.read((char *) data_out.drft.data(), ldrft)) {
         return false;
     }
+    ms_read = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_read0).count();
 
     // rebuild server_tokens from raw ids
     prompt_out.clear();
@@ -644,11 +592,20 @@ bool server_prompt_disk::load_entry(
         prompt_out.tokens.push_back(t);
     }
     prompt_out.checkpoints = std::move(ckpts);
-    ms_parse = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
 
-    // touch for LRU
-    std::error_code ec;
-    fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
+    // touch for LRU (file + index row)
+    {
+        std::error_code ec;
+        const auto now = fs::file_time_type::clock::now();
+        fs::last_write_time(path, now, ec);
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto & e : index) {
+            if (e.path == path) {
+                e.mtime = now;
+                break;
+            }
+        }
+    }
 
     SRV_INF("prompt disk: loaded entry %s (%d tokens)\n", path.c_str(), (int) tokens.size());
     return true;
@@ -663,51 +620,37 @@ void server_prompt_disk::enforce_budget() const {
     if (budget_bytes == 0) {
         return;
     }
-    // delete oldest files until under budget
-    for (int guard_iter = 0; guard_iter < 100000; guard_iter++) {
-        uint64_t total = 0;
-        std::string oldest;
-        fs::file_time_type oldest_t = fs::file_time_type::max();
+    // all our files are tracked in the in-memory index: no directory rescan.
+    // mtimes are recorded at scan/write/load-touch time.
+    std::lock_guard<std::mutex> lock(mutex);
+    // drop rows whose files vanished out of band
+    for (auto it = index.begin(); it != index.end();) {
         std::error_code ec;
-        for (const auto & de : fs::directory_iterator(dir, ec)) {
-            if (ec || !de.is_regular_file()) {
-                continue;
-            }
-            const auto path = de.path().string();
-            if (path.size() < 7 || path.compare(path.size() - 7, 7, ".centry") != 0) {
-                continue;
-            }
-            std::error_code ec2;
-            total += fs::file_size(path, ec2);
-            std::error_code ec3;
-            const auto t = fs::last_write_time(path, ec3);
-            if (!ec3 && t < oldest_t) {
-                oldest_t = t;
-                oldest = path;
+        if (fs::exists(it->path, ec)) {
+            ++it;
+        } else {
+            index_bytes -= it->bytes;
+            it = index.erase(it);
+        }
+    }
+    for (int guard_iter = 0; guard_iter < 100000; guard_iter++) {
+        if (index_bytes <= budget_bytes) {
+            break;
+        }
+        auto oldest = index.end();
+        for (auto it = index.begin(); it != index.end(); ++it) {
+            if (oldest == index.end() || it->mtime < oldest->mtime) {
+                oldest = it;
             }
         }
-        if (total <= budget_bytes || oldest.empty()) {
+        if (oldest == index.end()) {
             break;
         }
         std::error_code ec4;
-        fs::remove(oldest, ec4);
-        SRV_WRN("prompt disk: budget exceeded, evicted %s\n", oldest.c_str());
-    }
-    // drop index rows whose files are gone
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (auto it = index.begin(); it != index.end();) {
-            std::error_code ec5;
-            if (fs::exists(it->path, ec5)) {
-                ++it;
-            } else {
-                it = index.erase(it);
-            }
-        }
-        index_bytes = 0;
-        for (const auto & e : index) {
-            index_bytes += e.bytes;
-        }
+        fs::remove(oldest->path, ec4);
+        SRV_WRN("prompt disk: budget exceeded, evicted %s\n", oldest->path.c_str());
+        index_bytes -= oldest->bytes;
+        index.erase(oldest);
     }
 }
 
@@ -735,6 +678,9 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
             SRV_WRN("prompt disk: cannot write %s\n", tmp.c_str());
             return;
         }
+        // large buffer: header small writes stay cheap, GB blob writes go out in big chunks
+        std::vector<char> io_buf(4 * 1024 * 1024);
+        f.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
         const uint32_t magic = PDC_MAGIC, ver = PDC_VER;
         wr(f, &magic, sizeof(magic));
         wr(f, &ver, sizeof(ver));
@@ -784,6 +730,25 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
             fs::remove(tmp, ec);
             return;
         }
+        // flush OS buffers before rename so a crash cannot leave a torn entry
+#ifdef _WIN32
+        {
+            HANDLE h = CreateFileA(tmp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                FlushFileBuffers(h);
+                CloseHandle(h);
+            }
+        }
+#else
+        {
+            const int fd = ::open(tmp.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                ::fsync(fd);
+                ::close(fd);
+            }
+        }
+#endif
     }
     std::error_code ec;
     fs::rename(tmp, path, ec);
@@ -809,6 +774,7 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
         e.has_full_state = !item.data_main.empty();
         e.format_version = PDC_VER;
         e.bytes = bytes;
+        e.mtime = fs::file_time_type::clock::now();
         index.push_back(std::move(e));
         index_bytes += bytes;
 

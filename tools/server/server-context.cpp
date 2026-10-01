@@ -2370,6 +2370,7 @@ private:
         if (slot.prompt.tokens.size() == 0 || slot.prompt.checkpoints.empty()) {
             return;
         }
+        const int64_t t_snap = ggml_time_us();
         const size_t size_tgt = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         std::vector<uint8_t> data_tgt(size_tgt), data_dft(size_dft);
@@ -2379,7 +2380,9 @@ private:
         if (size_dft) {
             llama_state_seq_get_data_ext(slot.ctx_dft, data_dft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
-        prompt_disk->store(slot.prompt.tokens, slot.prompt.checkpoints, data_tgt, data_dft);
+        SLT_TRC(slot, "prompt disk snapshot took %.2f ms (%.3f MiB)\n",
+                (ggml_time_us() - t_snap) / 1000.0, (float) (size_tgt + size_dft) / 1024 / 1024);
+        prompt_disk->store(slot.prompt.tokens, slot.prompt.checkpoints, std::move(data_tgt), std::move(data_dft));
     }
 
     // returns false to decline the task, it is offered again after the decode is done
