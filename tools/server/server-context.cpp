@@ -2349,7 +2349,8 @@ private:
                 llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), full_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
             }
             prompt_disk->store_prefix_checkpoint(slot.prompt.tokens, cur,
-                    (size_t) params_base.prompt_cache_disk_prefix_tokens, data_tgt, data_dft);
+                    (size_t) params_base.prompt_cache_disk_prefix_tokens,
+                    std::move(data_tgt), std::move(data_dft));
         }
 
         SLT_TRC(slot,
@@ -2382,6 +2383,12 @@ private:
         }
         SLT_TRC(slot, "prompt disk snapshot took %.2f ms (%.3f MiB)\n",
                 (ggml_time_us() - t_snap) / 1000.0, (float) (size_tgt + size_dft) / 1024 / 1024);
+        // NOTE: checkpoints must be COPIED, not moved: the live slot keeps its
+        // tokens across release() and needs the checkpoint index for the next
+        // request's usable-length computation. Moving them out degrades the
+        // base to raw LCP (f_sim == 1.0), which the strict-inequality candidate
+        // selection can never beat -- silently disabling the whole cache.
+        // data_tgt/data_dft are true locals and are moved.
         prompt_disk->store(slot.prompt.tokens, slot.prompt.checkpoints, std::move(data_tgt), std::move(data_dft));
     }
 

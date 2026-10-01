@@ -357,7 +357,7 @@ void server_prompt_disk::scan() {
 
 void server_prompt_disk::store(
         const server_tokens & tokens,
-        const std::list<common_prompt_checkpoint> & checkpoints,
+        std::list<common_prompt_checkpoint> checkpoints,
         std::vector<uint8_t> data_main,
         std::vector<uint8_t> data_drft) const {
     if (tokens.size() < min_tokens || checkpoints.empty()) {
@@ -365,7 +365,7 @@ void server_prompt_disk::store(
     }
     queue_item item;
     item.tokens = tokens.get_text_tokens();
-    item.checkpoints = checkpoints;
+    item.checkpoints = std::move(checkpoints);
     item.data_main = std::move(data_main);
     item.data_drft = std::move(data_drft);
     {
@@ -495,14 +495,15 @@ bool server_prompt_disk::load_entry(
     ms_read = 0.0;
     ms_parse = 0.0;
 
+    // large stream buffer: header/checkpoint small reads stay cheap,
+    // blob reads stay sequential. blobs are read directly into their
+    // destination vectors (no whole-file staging copy).
+    // Declared before `f` so it outlives the stream (filebuf holds its pointer).
+    std::vector<char> io_buf(4 * 1024 * 1024);
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         return false;
     }
-    // large stream buffer: header/checkpoint small reads stay cheap,
-    // blob reads stay sequential. blobs are read directly into their
-    // destination vectors (no whole-file staging copy).
-    std::vector<char> io_buf(4 * 1024 * 1024);
     f.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
 
     const auto t_parse0 = std::chrono::steady_clock::now();
@@ -661,11 +662,13 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
 
     {
         std::lock_guard<std::mutex> lock(mutex);
-        for (const auto & e : index) {
+        for (auto & e : index) {
             if (e.hash == h && e.path == path) {
-                // exact duplicate, refresh LRU time and skip
+                // exact duplicate, refresh LRU time (file + index row) and skip
+                const auto now = fs::file_time_type::clock::now();
                 std::error_code ec;
-                fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
+                fs::last_write_time(path, now, ec);
+                e.mtime = now;
                 return;
             }
         }
@@ -673,13 +676,14 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
 
     const std::string tmp = path + ".tmp";
     {
+        // large buffer: header small writes stay cheap, GB blob writes go out in big chunks.
+        // Declared before `f` so it outlives the stream (filebuf holds its pointer).
+        std::vector<char> io_buf(4 * 1024 * 1024);
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             SRV_WRN("prompt disk: cannot write %s\n", tmp.c_str());
             return;
         }
-        // large buffer: header small writes stay cheap, GB blob writes go out in big chunks
-        std::vector<char> io_buf(4 * 1024 * 1024);
         f.rdbuf()->pubsetbuf(io_buf.data(), io_buf.size());
         const uint32_t magic = PDC_MAGIC, ver = PDC_VER;
         wr(f, &magic, sizeof(magic));
@@ -733,11 +737,17 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
         // flush OS buffers before rename so a crash cannot leave a torn entry
 #ifdef _WIN32
         {
-            HANDLE h = CreateFileA(tmp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            // FlushFileBuffers requires a handle with write access; a read-only
+            // handle fails silently and leaves the snapshot non-durable.
+            HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(h);
+                if (!FlushFileBuffers(h)) {
+                    SRV_WRN("prompt disk: FlushFileBuffers failed for %s\n", tmp.c_str());
+                }
                 CloseHandle(h);
+            } else {
+                SRV_WRN("prompt disk: cannot open %s for flush\n", tmp.c_str());
             }
         }
 #else

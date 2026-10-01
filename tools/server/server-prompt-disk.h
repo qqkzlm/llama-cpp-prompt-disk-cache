@@ -53,10 +53,10 @@ struct server_prompt_disk {
     void scan();
 
     // move entry into the background-write queue. drops exact duplicates. thread-safe.
-    // data vectors are taken by value: pass std::move()d locals to avoid a copy.
+    // checkpoints and data vectors are taken by value: pass std::move()d locals to avoid a copy.
     void store(
         const server_tokens & tokens,
-        const std::list<common_prompt_checkpoint> & checkpoints,
+        std::list<common_prompt_checkpoint> checkpoints,
         std::vector<uint8_t> data_main,
         std::vector<uint8_t> data_drft) const;
 
