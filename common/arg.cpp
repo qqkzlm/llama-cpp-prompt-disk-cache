@@ -3611,6 +3611,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_MIN_TOKENS"));
     add_opt(common_arg(
+        {"--prompt-cache-disk-namespace"}, "NAME",
+        "optional namespace subdirectory for the on-disk prompt cache (for project isolation)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty() || value == "." || value == ".."
+                    || value.find_first_of("/\\:") != std::string::npos) {
+                throw std::invalid_argument("prompt-cache-disk-namespace must be a single safe path component");
+            }
+            params.prompt_cache_disk_namespace = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_NAMESPACE"));
+    add_opt(common_arg(
+        {"--prompt-cache-disk-checkpoints"}, "N",
+        "maximum number of most recent checkpoints stored per full disk entry (default: 8, 0 = all)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-cache-disk-checkpoints must be non-negative");
+            }
+            params.prompt_cache_disk_checkpoints = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_CHECKPOINTS"));
+    add_opt(common_arg(
         {"--prompt-cache-disk-path"}, "PATH",
         "on-disk prompt cache directory (default: <slot-save-path>/pdcache, needs --slot-save-path)",
         [](common_params & params, const std::string & value) {

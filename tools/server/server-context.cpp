@@ -1305,6 +1305,9 @@ private:
             if (params_base.prompt_cache_disk_prefix_only) {
                 disk_dir += "prefix-only" + std::string(1, DIRECTORY_SEPARATOR);
             }
+            if (!params_base.prompt_cache_disk_namespace.empty()) {
+                disk_dir += params_base.prompt_cache_disk_namespace + std::string(1, DIRECTORY_SEPARATOR);
+            }
             if (!disk_dir.empty()) {
                 // on-disk L2 for the prompt cache
                 std::error_code ec;
@@ -1325,6 +1328,7 @@ private:
                     disk_dir,
                     (uint64_t) params_base.prompt_cache_disk_budget_gb * 1024ull * 1024ull * 1024ull,
                     (size_t) params_base.prompt_cache_disk_min_tokens,
+                    (size_t) params_base.prompt_cache_disk_checkpoints,
                     guard);
                 prompt_disk->scan();
                 prompt_cache->set_disk(prompt_disk.get());
@@ -1635,16 +1639,9 @@ private:
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
 
-            // A branch switch needs the L2 lookup even when the old slot was
-            // not considered sufficiently dissimilar by f_keep.  This is the
-            // path that restores conversation A after conversation B replaced
-            // the only RAM slot.
-            if (lookup_cache && save_previous_slot) {
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
-                }
-                prompt_cache->update();
-            }
+            // (single prompt_load above already performs both the RAM and the
+            // on-disk lookup; a second call here would only re-run find_best
+            // and was removed to avoid a redundant index scan per request)
         }
 
         return ret;
@@ -2381,7 +2378,7 @@ private:
         if (size_dft) {
             llama_state_seq_get_data_ext(slot.ctx_dft, data_dft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
-        SLT_TRC(slot, "prompt disk snapshot took %.2f ms (%.3f MiB)\n",
+        SLT_INF(slot, "prompt disk snapshot took %.2f ms (%.3f MiB)\n",
                 (ggml_time_us() - t_snap) / 1000.0, (float) (size_tgt + size_dft) / 1024 / 1024);
         // NOTE: checkpoints must be COPIED, not moved: the live slot keeps its
         // tokens across release() and needs the checkpoint index for the next

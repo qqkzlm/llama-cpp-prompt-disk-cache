@@ -142,8 +142,10 @@ server_prompt_disk::server_prompt_disk(
         const std::string & dir,
         uint64_t budget_bytes,
         size_t min_tokens,
+        size_t max_checkpoints,
         const server_prompt_disk_guard & guard)
-    : dir(dir), budget_bytes(budget_bytes), min_tokens(min_tokens), guard(guard) {
+    : dir(dir), budget_bytes(budget_bytes), min_tokens(min_tokens),
+      max_checkpoints(max_checkpoints), guard(guard) {
     for (const unsigned char c : guard.model_fingerprint) {
         guard_hash ^= c;
         guard_hash *= 1099511628211ull;
@@ -180,15 +182,30 @@ static bool same_path(std::string a, std::string b) {
     });
 }
 
-static bool guard_same(const server_prompt_disk_guard & a, const server_prompt_disk_guard & b, uint32_t version) {
+static std::string guard_diff(const server_prompt_disk_guard & a, const server_prompt_disk_guard & b, uint32_t version) {
     const bool same_model = version == 1
         ? same_path(a.model_fingerprint, b.legacy_model_path)
         : a.model_fingerprint == b.model_fingerprint;
-    return same_model
-        && a.flash_attn == b.flash_attn
-        && a.cache_k == b.cache_k
-        && a.cache_v == b.cache_v
-        && a.build == b.build;
+    if (!same_model) {
+        return "model";
+    }
+    if (a.flash_attn != b.flash_attn) {
+        return string_format("flash_attn (%d != %d)", (int) a.flash_attn, (int) b.flash_attn);
+    }
+    if (a.cache_k != b.cache_k) {
+        return string_format("cache_k (%d != %d)", (int) a.cache_k, (int) b.cache_k);
+    }
+    if (a.cache_v != b.cache_v) {
+        return string_format("cache_v (%d != %d)", (int) a.cache_v, (int) b.cache_v);
+    }
+    if (a.build != b.build) {
+        return string_format("build ('%s' != '%s')", a.build.c_str(), b.build.c_str());
+    }
+    return std::string();
+}
+
+static bool guard_same(const server_prompt_disk_guard & a, const server_prompt_disk_guard & b, uint32_t version) {
+    return guard_diff(a, b, version).empty();
 }
 
 // read header + guard + tokens only, leave the stream positioned at checkpoints
@@ -227,9 +244,24 @@ static bool read_entry_head(
 }
 
 void server_prompt_disk::scan() {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     index.clear();
     index_bytes = 0;
+
+    // Entries that this process cannot use still consume disk. Keep them in the
+    // index as `usable = false` so enforce_budget() counts and can evict them;
+    // otherwise they leak forever (they are invisible to the in-memory index).
+    auto add_unusable = [&](const std::string & path) {
+        index_entry e;
+        e.path = path;
+        e.usable = false;
+        std::error_code ec_size;
+        e.bytes = fs::file_size(path, ec_size);
+        std::error_code ec_time;
+        e.mtime = fs::last_write_time(path, ec_time);
+        index.push_back(std::move(e));
+        index_bytes += index.back().bytes;
+    };
 
     std::error_code ec;
     for (const auto & de : fs::directory_iterator(dir, ec)) {
@@ -248,6 +280,7 @@ void server_prompt_disk::scan() {
         }
         std::ifstream f(path, std::ios::binary);
         if (!f) {
+            add_unusable(path);
             continue;
         }
         server_prompt_disk_guard g;
@@ -255,14 +288,21 @@ void server_prompt_disk::scan() {
         uint32_t version = 0;
         llama_tokens tokens;
         if (!read_entry_head(f, g, n_ctx, tokens, version)) {
-            SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+            SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+            std::error_code ec_rm;
+            fs::remove(path, ec_rm);
             continue;
         }
         if (!guard_same(g, guard, version)) {
-            SRV_WRN("prompt disk: ignoring entry from another config %s\n", path.c_str());
+            SRV_WRN("prompt disk: ignoring entry from another config %s (%s)\n",
+                    path.c_str(), guard_diff(g, guard, version).c_str());
+            add_unusable(path);
             continue;
         }
         if ((int64_t) tokens.size() > guard.n_ctx) {
+            SRV_WRN("prompt disk: ignoring entry with too many tokens %s (%zu > %d)\n",
+                    path.c_str(), tokens.size(), guard.n_ctx);
+            add_unusable(path);
             continue;
         }
         // parse checkpoint positions only (seek past blobs, no data read)
@@ -274,7 +314,9 @@ void server_prompt_disk::scan() {
         {
             uint64_t nckpt = 0;
             if (!rd(f, &nckpt, sizeof(nckpt)) || nckpt > 4096) {
-                SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+                SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+                std::error_code ec_rm;
+                fs::remove(path, ec_rm);
                 continue;
             }
             bool ck_ok = true;
@@ -306,26 +348,34 @@ void server_prompt_disk::scan() {
                 }
             }
             if (!ck_ok) {
-                SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+                SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+                std::error_code ec_rm;
+                fs::remove(path, ec_rm);
                 continue;
             }
             if (version >= 3) {
                 uint8_t prefix_flag = 0;
                 if (!rd(f, &prefix_flag, sizeof(prefix_flag))) {
-                    SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+                    SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+                    std::error_code ec_rm;
+                    fs::remove(path, ec_rm);
                     continue;
                 }
                 is_prefix = prefix_flag != 0;
                 uint64_t lmain = 0;
                 if (!rd(f, &lmain, sizeof(lmain))) {
-                    SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+                    SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+                    std::error_code ec_rm;
+                    fs::remove(path, ec_rm);
                     continue;
                 }
                 has_full_state = lmain != 0;
             } else {
                 uint64_t lmain = 0;
                 if (!rd(f, &lmain, sizeof(lmain))) {
-                    SRV_WRN("prompt disk: ignoring unreadable entry %s\n", path.c_str());
+                    SRV_WRN("prompt disk: removing unreadable entry %s\n", path.c_str());
+                    std::error_code ec_rm;
+                    fs::remove(path, ec_rm);
                     continue;
                 }
                 has_full_state = lmain != 0;
@@ -351,13 +401,19 @@ void server_prompt_disk::scan() {
         index_bytes += index.back().bytes;
     }
 
-    SRV_INF("prompt disk: scanned %s, %zu entries, %.3f MiB\n",
-            dir.c_str(), index.size(), index_bytes / (1024.0 * 1024.0));
+    size_t usable_entries = 0;
+    for (const auto & e : index) {
+        usable_entries += e.usable ? 1u : 0u;
+    }
+    SRV_INF("prompt disk: scanned %s, %zu entries (%zu usable), %.3f MiB\n",
+            dir.c_str(), index.size(), usable_entries, index_bytes / (1024.0 * 1024.0));
+    lock.unlock();
+    enforce_budget();
 }
 
 void server_prompt_disk::store(
         const server_tokens & tokens,
-        std::list<common_prompt_checkpoint> checkpoints,
+        const std::list<common_prompt_checkpoint> & checkpoints,
         std::vector<uint8_t> data_main,
         std::vector<uint8_t> data_drft) const {
     if (tokens.size() < min_tokens || checkpoints.empty()) {
@@ -365,7 +421,14 @@ void server_prompt_disk::store(
     }
     queue_item item;
     item.tokens = tokens.get_text_tokens();
-    item.checkpoints = std::move(checkpoints);
+    if (max_checkpoints == 0 || checkpoints.size() <= max_checkpoints) {
+        item.checkpoints = checkpoints;
+    } else {
+        const size_t skip = checkpoints.size() - max_checkpoints;
+        auto first = checkpoints.begin();
+        std::advance(first, (std::ptrdiff_t) skip);
+        item.checkpoints.assign(first, checkpoints.end());
+    }
     item.data_main = std::move(data_main);
     item.data_drft = std::move(data_drft);
     {
@@ -443,6 +506,9 @@ bool server_prompt_disk::find_best(const server_tokens & query, std::string & ou
     bool found = false;
     uint32_t best_version = 0;
     for (const auto & e : index) {
+        if (!e.usable) {
+            continue;
+        }
         const int lcp = common_prefix_len(e.tokens, query);
         // Usable length depends on whether this entry carries a complete state.
         // - prefix entry with full state: reusable iff the whole stored prefix
@@ -638,10 +704,19 @@ void server_prompt_disk::enforce_budget() const {
         if (index_bytes <= budget_bytes) {
             break;
         }
+        // Config-incompatible entries can never be reused by this process. Evict
+        // those first so they do not displace current-build cache entries.
         auto oldest = index.end();
         for (auto it = index.begin(); it != index.end(); ++it) {
-            if (oldest == index.end() || it->mtime < oldest->mtime) {
+            if (!it->usable && (oldest == index.end() || it->mtime < oldest->mtime)) {
                 oldest = it;
+            }
+        }
+        if (oldest == index.end()) {
+            for (auto it = index.begin(); it != index.end(); ++it) {
+                if (oldest == index.end() || it->mtime < oldest->mtime) {
+                    oldest = it;
+                }
             }
         }
         if (oldest == index.end()) {
@@ -791,6 +866,11 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
         if (!item.checkpoint_only) {
             // A full prompt entry covers shorter entries with the same prefix.
             for (auto it = index.begin(); it != index.end();) {
+                if (!it->usable) {
+                    // never prune config-mismatch entries via prefix logic; budget eviction handles them
+                    ++it;
+                    continue;
+                }
                 const bool exact_legacy = it->hash == h && it->tokens == item.tokens && it->path != path;
                 const bool shorter_prefix = it->hash != h
                         && it->tokens.size() < item.tokens.size()

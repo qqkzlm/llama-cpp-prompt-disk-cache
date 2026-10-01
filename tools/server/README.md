@@ -161,6 +161,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | -------- | ----------- |
 | `-lcs, --lookup-cache-static FNAME` | path to static lookup cache to use for lookup decoding (not updated by generation) |
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
+| `--prompt-cache-disk-checkpoints N` | maximum newest checkpoint payloads stored per full disk entry (default: 8; 0 = all)<br/>(env: `LLAMA_ARG_PROMPT_CACHE_DISK_CHECKPOINTS`) |
+| `--prompt-cache-disk-namespace NAME` | optional project/workload isolation subdirectory<br/>(env: `LLAMA_ARG_PROMPT_CACHE_DISK_NAMESPACE`) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
@@ -596,7 +598,7 @@ llama-server \
     --no-prompt-cache-disk-prefix-only
 ```
 
-On Windows, use a path such as `D:\\llama-cache\\qwen`. The cache directory and its `pdcache` child are created automatically. The cache is bound to the model fingerprint, context size, Flash Attention setting, KV types, and build identity; incompatible entries are ignored.
+On Windows, use a path such as `D:\\llama-cache\\qwen`. The cache directory and its `pdcache` child are created automatically. The cache is bound to the model fingerprint, context size, Flash Attention setting, KV types, and build identity; incompatible entries are ignored for lookup but remain budget-accounted and are evicted before usable entries when the budget is exceeded. Use `--prompt-cache-disk-checkpoints N` to cap the number of newest (furthest-forward) checkpoint payloads stored per full entry (default: 8; `0` keeps all). Use `--prompt-cache-disk-namespace NAME` to isolate entries in a subdirectory for a project or workload; leave it unset to share the cache across sessions.
 
 #### Full snapshots are the supported mode
 
@@ -605,7 +607,7 @@ For hybrid models with recurrent or SWA state, a reusable prefix must include th
 - the complete prompt tokens are stored;
 - the complete target sequence state is stored;
 - the complete draft sequence state is stored when draft decoding is enabled;
-- the checkpoint metadata is stored so the hybrid state can select a safe restore boundary;
+- the newest checkpoints up to `--prompt-cache-disk-checkpoints` are stored so the hybrid state can select a safe restore boundary;
 - after a branch, only the tokens after the selected checkpoint are evaluated again.
 
 `--prompt-cache-disk-prefix-only` is intentionally disabled by this fork. Enabling it returns an error because the former partial-checkpoint implementation can report a cache hit while producing a different continuation on hybrid models. It will remain disabled until a non-blocking, correctness-verified implementation is available.
@@ -637,7 +639,7 @@ prompt disk: restored 9136 prompt tokens to device (28 ms)
 
 `--checkpoint-min-step N` controls the minimum spacing between usable hybrid checkpoints. Smaller values can reduce suffix recomputation after a conversation branch, but increase checkpoint metadata and state-management overhead. A practical starting point is `2048`; use `4096` when disk and memory pressure matter more than branch-switch latency.
 
-`--ctx-checkpoints N` limits the number of in-memory checkpoints. It does not change the complete snapshot size. A complete Qwen/Bonsai snapshot can be hundreds of MiB, so leave several GiB of free space in addition to the configured cache budget. The budget is only an eviction limit; it cannot compensate for insufficient free space on the filesystem.
+`--ctx-checkpoints N` limits the number of in-memory checkpoints. It also bounds the source checkpoint set, but use `--prompt-cache-disk-checkpoints N` to independently control how many are serialized to each disk entry. The disk option keeps the newest checkpoints; their saved states are complete snapshots rather than deltas, so reducing this value lowers file size while potentially moving branch reuse to an earlier checkpoint. `0` disables the disk-side cap. Keep the in-memory count high enough for runtime rewind and choose the disk cap based on the storage/reuse trade-off.
 
 #### Troubleshooting
 

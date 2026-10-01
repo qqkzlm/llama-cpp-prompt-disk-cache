@@ -42,6 +42,7 @@ struct server_prompt_disk {
         const std::string & dir,
         uint64_t budget_bytes,
         size_t min_tokens,
+        size_t max_checkpoints,
         const server_prompt_disk_guard & guard);
 
     ~server_prompt_disk();
@@ -53,13 +54,15 @@ struct server_prompt_disk {
     void scan();
 
     // move entry into the background-write queue. drops exact duplicates. thread-safe.
-    // checkpoints and data vectors are taken by value: pass std::move()d locals to avoid a copy.
+    // Full-state data vectors are moved; checkpoints are copied selectively so the
+    // live slot keeps its rewind history while the disk entry retains only the newest N.
     void store(
         const server_tokens & tokens,
-        std::list<common_prompt_checkpoint> checkpoints,
+        const std::list<common_prompt_checkpoint> & checkpoints,
         std::vector<uint8_t> data_main,
         std::vector<uint8_t> data_drft) const;
 
+    // Retain only the most recent (furthest-forward) complete checkpoints on disk.
     void store_prefix_checkpoint(
         const server_tokens & tokens,
         const common_prompt_checkpoint & checkpoint,
@@ -83,7 +86,7 @@ struct server_prompt_disk {
 
 private:
     struct index_entry {
-        uint64_t hash;
+        uint64_t hash = 0;
         std::string path;
         llama_tokens tokens; // for prefix compare (full prompt or token prefix)
         std::vector<int64_t> ckpt_ntok; // checkpoint n_tokens list, for usable-length
@@ -93,6 +96,7 @@ private:
         uint32_t format_version = 0;
         uint64_t bytes = 0;
         std::filesystem::file_time_type mtime = std::filesystem::file_time_type::min();
+        bool usable = true; // false = config-mismatch/corrupt entry; still budgeted, never matched
     };
 
     struct queue_item {
@@ -111,6 +115,7 @@ private:
     std::string dir;
     uint64_t budget_bytes;
     size_t min_tokens;
+    size_t max_checkpoints;
     server_prompt_disk_guard guard;
 
     mutable std::mutex mutex;
