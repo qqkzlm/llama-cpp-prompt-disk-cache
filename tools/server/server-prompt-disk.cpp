@@ -735,16 +735,38 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
     const uint64_t h = server_prompt_disk_hash(item.tokens);
     const std::string path = path_for(h);
 
+    // The cache directory can be removed while the server is running.  It is
+    // normally created during server startup, but the background writer must
+    // recreate it before opening the temporary file as well.
+    {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec || !fs::is_directory(dir, ec)) {
+            SRV_WRN("prompt disk: cannot create cache directory %s: %s\n",
+                    dir.c_str(), ec ? ec.message().c_str() : "path is not a directory");
+            return;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex);
-        for (auto & e : index) {
+        for (auto it = index.begin(); it != index.end(); ++it) {
+            auto & e = *it;
             if (e.hash == h && e.path == path) {
                 // exact duplicate, refresh LRU time (file + index row) and skip
-                const auto now = fs::file_time_type::clock::now();
                 std::error_code ec;
-                fs::last_write_time(path, now, ec);
-                e.mtime = now;
-                return;
+                if (fs::exists(path, ec) && !ec) {
+                    const auto now = fs::file_time_type::clock::now();
+                    fs::last_write_time(path, now, ec);
+                    e.mtime = now;
+                    return;
+                }
+
+                // The file was removed externally.  Drop the stale index row
+                // so the newly written snapshot is accepted below.
+                index_bytes -= e.bytes;
+                index.erase(it);
+                break;
             }
         }
     }
@@ -836,10 +858,27 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
 #endif
     }
     std::error_code ec;
-    fs::rename(tmp, path, ec);
-    if (ec) {
+    // The directory may have been removed after the initial check while the
+    // large snapshot was being serialized.  Recreate it before the atomic
+    // rename, then retry the rename once if the race still occurred.
+    fs::create_directories(dir, ec);
+    if (ec || !fs::is_directory(dir, ec)) {
+        SRV_WRN("prompt disk: cannot recreate cache directory %s: %s\n",
+                dir.c_str(), ec ? ec.message().c_str() : "path is not a directory");
         fs::remove(tmp, ec);
         return;
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code mkdir_ec;
+        fs::create_directories(dir, mkdir_ec);
+        if (!mkdir_ec) {
+            fs::rename(tmp, path, ec);
+        }
+        if (ec) {
+            fs::remove(tmp, ec);
+            return;
+        }
     }
 
     uint64_t bytes = 0;

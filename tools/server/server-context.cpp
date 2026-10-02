@@ -2286,6 +2286,21 @@ private:
         return true;
     }
 
+    int checkpoint_step_for(llama_pos pos) const {
+        if (params_base.checkpoint_min_step == 0) {
+            return 0;
+        }
+        if (params_base.checkpoint_range1_end < params_base.checkpoint_range2_end
+                && params_base.checkpoint_range1_step > 0
+                && params_base.checkpoint_range2_step > 0
+                && params_base.checkpoint_range3_step > 0) {
+            if (pos < params_base.checkpoint_range1_end) return params_base.checkpoint_range1_step;
+            if (pos < params_base.checkpoint_range2_end) return params_base.checkpoint_range2_step;
+            return params_base.checkpoint_range3_step;
+        }
+        return params_base.checkpoint_min_step;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2294,7 +2309,7 @@ private:
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + checkpoint_step_for(it->n_tokens)) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3643,7 +3658,7 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     const size_t checkpoint_batch_limit = params_base.prompt_cache_disk_prefix_only
-                            ? (size_t) std::max(1, params_base.checkpoint_min_step)
+                            ? (size_t) std::max(1, checkpoint_step_for(slot.prompt.n_tokens()))
                             : (size_t) n_batch;
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch
                             && batch.size() - n_tokens_prev < checkpoint_batch_limit) {
@@ -3676,7 +3691,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + checkpoint_step_for(pos)) {
                                 break;
                             }
                         }
@@ -3715,7 +3730,7 @@ private:
 
                     const auto & checkpoints = slot.prompt.checkpoints;
                     const bool checkpoint_spacing_due = checkpoints.empty() || params_base.checkpoint_min_step == 0 ||
-                            n_tokens_start >= checkpoints.back().n_tokens + params_base.checkpoint_min_step;
+                            n_tokens_start >= checkpoints.back().n_tokens + checkpoint_step_for(n_tokens_start);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3754,7 +3769,7 @@ private:
                             slot.prompt.checkpoints.empty() ||
                             checkpoint_spacing_due ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_step_for(n_tokens_start));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

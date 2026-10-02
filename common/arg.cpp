@@ -1702,6 +1702,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-range1-end"}, "N", "end position of checkpoint range 1 (default: 30000)",
+        [](common_params & params, int value) { if (value < 0) throw std::invalid_argument("checkpoint-range1-end must be non-negative"); params.checkpoint_range1_end = value; }
+    ).set_env("LLAMA_ARG_CHECKPOINT_RANGE1_END").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-range1-step"}, "N", "spacing for checkpoint range 1 (default: 10000)",
+        [](common_params & params, int value) { if (value <= 0) throw std::invalid_argument("checkpoint-range1-step must be positive"); params.checkpoint_range1_step = value; }
+    ).set_env("LLAMA_ARG_CHECKPOINT_RANGE1_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-range2-end"}, "N", "end position of checkpoint range 2 (default: 40000)",
+        [](common_params & params, int value) { if (value < 0) throw std::invalid_argument("checkpoint-range2-end must be non-negative"); params.checkpoint_range2_end = value; }
+    ).set_env("LLAMA_ARG_CHECKPOINT_RANGE2_END").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-range2-step"}, "N", "spacing for checkpoint range 2 (default: 512)",
+        [](common_params & params, int value) { if (value <= 0) throw std::invalid_argument("checkpoint-range2-step must be positive"); params.checkpoint_range2_step = value; }
+    ).set_env("LLAMA_ARG_CHECKPOINT_RANGE2_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-range3-step"}, "N", "spacing after checkpoint range 2 (default: 4096)",
+        [](common_params & params, int value) { if (value <= 0) throw std::invalid_argument("checkpoint-range3-step must be positive"); params.checkpoint_range3_step = value; }
+    ).set_env("LLAMA_ARG_CHECKPOINT_RANGE3_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
