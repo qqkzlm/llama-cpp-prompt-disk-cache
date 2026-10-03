@@ -7,8 +7,8 @@
 
 ### 1. 下载带缓存功能的 server
 
-- **Windows CUDA（NVIDIA）**：从 [v0.2.1 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.1) 下载
-  `llama-server-win-cuda-v0.2.1.zip`，解压后使用其中的 `llama-server.exe`。
+- **Windows CUDA（NVIDIA）**：从 [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2) 下载
+  `llama-server-win-cuda-v0.2.2.zip`，解压后使用其中的 `llama-server.exe`。
 - **Linux / 其他后端**：下载源码后按 [构建说明](docs/build.md) 编译；本项目是
   [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 `prism` 分支补丁，
   不是 stock `ggml-org/llama.cpp` 二进制。
@@ -95,6 +95,7 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 >   --slot-save-path D:/kvstore/mymodel \    # checkpoint directory (pdcache)
 >   --checkpoint-min-step 4096 \              # save granularity: every 4096 tokens of growth
 >   --ctx-checkpoints 64 \                    # max checkpoints kept in RAM
+>   --prompt-cache-disk \                     # enable persistent disk snapshots
 >   --prompt-cache-disk-budget 20             # disk budget in GB
 > ```
 >
@@ -111,7 +112,19 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 > integration; see [tools/server/README.md](tools/server/README.md) for the full flag
 > reference. The source is maintained on top of the
 > [PrismML `prism` branch](https://github.com/PrismML-Eng/llama.cpp/tree/prism); grab the
-> current source or binaries from the [v0.2.1 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.1).
+> current source or binaries from the [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2).
+> The older [persistent-prompt-cache branch](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/tree/prism-persistent-prompt-cache)
+> is retained for historical release work; `main` is the active development line.
+
+### NVIDIA 驱动要求
+
+The v0.2.2 CUDA packages require an NVIDIA driver that supports CUDA 12.0 or newer.
+Before starting, run `nvidia-smi` and update the driver if the command fails or reports
+an older driver. The Windows package needs a Windows R525-class-or-newer driver; the
+Linux package was built for CUDA `sm_61` / Pascal and also requires a compatible Linux
+NVIDIA driver. A driver error during startup usually appears as `CUDA driver version is
+insufficient for CUDA runtime version`; this means the driver must be updated, not that
+the model or cache is broken.
 >
 > 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
 >
