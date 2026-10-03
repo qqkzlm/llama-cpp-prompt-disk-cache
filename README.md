@@ -1,5 +1,88 @@
 # llama.cpp + Persistent Prompt Disk Cache
 
+## 三步跑起来
+
+这是给第一次尝试的用户准备的最短路径。完整参数说明见
+[server 文档](tools/server/README.md)。
+
+### 1. 下载带缓存功能的 server
+
+- **Windows CUDA（NVIDIA）**：从 [v0.2.1 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.1) 下载
+  `llama-server-win-cuda-v0.2.1.zip`，解压后使用其中的 `llama-server.exe`。
+- **Linux / 其他后端**：下载源码后按 [构建说明](docs/build.md) 编译；本项目是
+  [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 `prism` 分支补丁，
+  不是 stock `ggml-org/llama.cpp` 二进制。
+- 只想使用 PrismML 官方预编译程序时，可从
+  [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) 下载对应硬件的包；
+  但请确认包内 server 已包含本项目的 persistent prompt disk cache 功能。
+
+### 2. 下载模型
+
+准备一个与 server 兼容的 `.gguf` 模型。Bonsai 系列模型和文件格式说明见
+[PrismML Bonsai collection](https://huggingface.co/collections/prism-ml/bonsai)。
+把模型路径替换到下面命令的 `-m` 参数；不要把模型文件提交到 Git 仓库。
+
+### 3. 启动 server
+
+Windows PowerShell 示例（路径按本机修改）：
+
+```powershell
+.\llama-server.exe `
+  -m D:\models\model.gguf `
+  --host 127.0.0.1 --port 8080 `
+  -c 32768 -np 1 -ngl 99 -fa on `
+  --slot-save-path D:\kvstore\model `
+  --prompt-cache-disk `
+  --prompt-cache-disk-budget 20 `
+  --checkpoint-min-step 2048 `
+  --ctx-checkpoints 64
+```
+
+看到下面的结果后，服务已经可以接受请求：
+
+```text
+HTTP GET /health -> {"status":"ok"}
+```
+
+若显存不足，先降低 `-c`；仍然不足时再逐步增加 `-ncmoe 1`、`2`、`4`。
+不要直接套用 GTX 1080 的 `-ncmoe 23`。RTX 30/40/50 系列的完整调参方法见下方指南。
+
+### 请求端：`cache_prompt` 默认就是开启
+
+客户端不需要额外改协议。`/completion` 的 `cache_prompt` 默认值是 `true`，
+但建议显式写出，排障时一眼能确认：
+
+```bash
+curl http://127.0.0.1:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Explain persistent KV cache in one paragraph.",
+    "cache_prompt": true,
+    "timings_per_token": true,
+    "n_predict": 128,
+    "temperature": 0.2
+  }'
+```
+
+连续请求时，必须保持从开头开始的 prompt 前缀完全一致；只有公共前缀能复用，
+不同的后缀仍然需要重新计算。响应中的关键字段：
+
+```json
+{
+  "tokens_cached": 22528,
+  "timings": {
+    "prompt_n": 4,
+    "prompt_per_second": 250.0,
+    "predicted_n": 128,
+    "predicted_per_second": 24.5
+  }
+}
+```
+
+`tokens_cached` 表示本次请求复用的 prompt token 数；`prompt_n` 是本次重新处理的
+prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负责在重启或分支切换
+后恢复状态，仍然需要 `cache_prompt: true` 才会进入正常的前缀匹配流程。
+
 > [!NOTE]
 > **This repo's purpose: an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.**
 >
@@ -26,8 +109,9 @@
 >
 > Implementation lives in `tools/server/server-prompt-disk.cpp` (~900 lines) plus slot/task
 > integration; see [tools/server/README.md](tools/server/README.md) for the full flag
-> reference. The patch is a single commit on top of the PrismML `prism` branch — grab it from
-> [Releases](../../releases) or `main...prism-persistent-prompt-cache`.
+> reference. The source is maintained on top of the
+> [PrismML `prism` branch](https://github.com/PrismML-Eng/llama.cpp/tree/prism); grab the
+> current source or binaries from the [v0.2.1 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.1).
 >
 > 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
 >

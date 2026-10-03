@@ -582,6 +582,30 @@ These words will not be included in the completion, so make sure to add them to 
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
+For a first API test, send `cache_prompt: true` explicitly even though it is the
+default. The second request must keep the same prompt prefix from token 0; only the
+new suffix can be different. `timings_per_token: true` adds the timing fields needed
+to verify the result:
+
+```bash
+curl http://127.0.0.1:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Explain persistent KV cache.","cache_prompt":true,"timings_per_token":true,"n_predict":128}'
+```
+
+Read the response as follows:
+
+- `tokens_cached`: prompt tokens reused from RAM or the persistent disk snapshot;
+- `timings.prompt_n`: prompt tokens evaluated during this request;
+- `timings.prompt_per_second`: prompt/prefill throughput;
+- `timings.predicted_n`: generated tokens;
+- `timings.predicted_per_second`: decode/吐字 throughput.
+
+If `tokens_cached` is zero, first check that the request uses `cache_prompt: true`,
+the prompt prefix is byte/token identical, and the server was started with the same
+model, context, KV types, and cache directory. A disk snapshot can be present while
+the request still has no reusable prefix if those inputs differ.
+
 ### Persistent prompt-disk cache
 
 This fork adds an optional persistent L2 prompt cache behind the normal in-memory prompt cache. It stores a complete sequence snapshot (target state, optional draft state, and prompt tokens) and can restore it after a server restart or when a single slot is switched between conversation branches.
