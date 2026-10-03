@@ -1,5 +1,9 @@
 # llama.cpp + Persistent Prompt Disk Cache
 
+[![Release](https://img.shields.io/github/v/release/qqkzlm/llama-cpp-prompt-disk-cache?color=brightgreen)](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Patch](https://img.shields.io/badge/patch-single%20commit-orange)](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
+
 > [!NOTE]
 > **This repo's purpose: an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.**
 >
@@ -28,6 +32,12 @@
 > integration; see [tools/server/README.md](tools/server/README.md) for the full flag
 > reference. The patch is a single commit on top of the PrismML `prism` branch — grab it from
 > [Releases](../../releases) or `main...prism-persistent-prompt-cache`.
+>
+> One-liner (86 KB, applies with `git am` on the PrismML `prism` branch):
+>
+> ```bash
+> curl -sL https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch -o pdcache.patch
+> ```
 >
 > 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
 >
