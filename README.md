@@ -5,10 +5,14 @@
 这是给第一次尝试的用户准备的最短路径。完整参数说明见
 [server 文档](tools/server/README.md)。
 
+> **适用范围：**下面的直接下载包是 NVIDIA CUDA 版本，适用于 Windows 和 Linux。
+> 它不包含模型，也不适用于 AMD/Intel/Apple GPU。第一次使用时不要双击
+> `llama-server.exe`；请在解压后的目录打开 PowerShell，让错误信息留在窗口里。
+
 ### 1. 下载带缓存功能的 server
 
 - **Windows CUDA（NVIDIA）**：从 [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2) 下载
-  `llama-server-win-cuda-v0.2.2.zip`，解压后使用其中的 `llama-server.exe`。
+  `llama-server-win-cuda-v0.2.2.zip`，解压整个目录，不要只拿走 `.exe`。
 - **Linux / 其他后端**：下载源码后按 [构建说明](docs/build.md) 编译；本项目是
   [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 `prism` 分支补丁，
   不是 stock `ggml-org/llama.cpp` 二进制。
@@ -20,17 +24,23 @@
 
 准备一个与 server 兼容的 `.gguf` 模型。Bonsai 系列模型和文件格式说明见
 [PrismML Bonsai collection](https://huggingface.co/collections/prism-ml/bonsai)。
-把模型路径替换到下面命令的 `-m` 参数；不要把模型文件提交到 Git 仓库。
+模型不在压缩包里，需要单独下载；把真实的模型文件路径替换到下面命令的 `-m`
+参数。不要把模型文件提交到 Git 仓库。
 
 ### 3. 启动 server
 
 Windows PowerShell 示例（路径按本机修改）：
 
 ```powershell
+# 先确认 NVIDIA 驱动可用；至少应能正常显示显卡信息
+nvidia-smi
+
+# 在解压后的 llama-server.exe 所在目录打开 PowerShell
 .\llama-server.exe `
   -m D:\models\model.gguf `
   --host 127.0.0.1 --port 8080 `
   -c 32768 -np 1 -ngl 99 -fa on `
+  --fit `
   --slot-save-path D:\kvstore\model `
   --prompt-cache-disk `
   --prompt-cache-disk-budget 20 `
@@ -49,7 +59,8 @@ Windows PowerShell 示例（路径按本机修改）：
 HTTP GET /health -> {"status":"ok"}
 ```
 
-若显存不足，先降低 `-c`；仍然不足时再逐步增加 `-ncmoe 1`、`2`、`4`。
+若 `nvidia-smi` 失败，先修复 NVIDIA 驱动。若 server 报显存不足，先降低 `-c`；
+仍然不足时再逐步增加 `-ncmoe 1`、`2`、`4`。
 不要直接套用 GTX 1080 的 `-ncmoe 23`。RTX 30/40/50 系列的完整调参方法见下方指南。
 
 ### 请求端：`cache_prompt` 默认就是开启
@@ -57,17 +68,21 @@ HTTP GET /health -> {"status":"ok"}
 客户端不需要额外改协议。`/completion` 的 `cache_prompt` 默认值是 `true`，
 但建议显式写出，排障时一眼能确认：
 
-```bash
-curl http://127.0.0.1:8080/completion \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Explain persistent KV cache in one paragraph.",
-    "cache_prompt": true,
-    "timings_per_token": true,
-    "n_predict": 128,
-    "temperature": 0.2
-  }'
+```powershell
+$body = @{
+    prompt = "Explain persistent KV cache in one paragraph."
+    cache_prompt = $true
+    timings_per_token = $true
+    n_predict = 128
+    temperature = 0.2
+} | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8080/completion `
+  -Method Post -ContentType "application/json" -Body $body
 ```
+
+把这条请求原样再发一次，第二次才有机会看到缓存复用。服务日志中出现
+`prompt disk: restored N prompt tokens to device` 表示从磁盘恢复；
+`prompt cache = total / reused / recomputed` 中的 `reused` 就是本次跳过的 token 数。
 
 连续请求时，必须保持从开头开始的 prompt 前缀完全一致；只有公共前缀能复用，
 不同的后缀仍然需要重新计算。响应中的关键字段：
