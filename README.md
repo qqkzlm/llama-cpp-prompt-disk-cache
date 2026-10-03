@@ -1,5 +1,20 @@
 # llama.cpp + Persistent Prompt Disk Cache
 
+[![Release](https://img.shields.io/github/v/release/qqkzlm/llama-cpp-prompt-disk-cache?color=brightgreen)](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Patch](https://img.shields.io/badge/patch-v0.1.0-orange)](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
+[![Backend](https://img.shields.io/badge/backend-CUDA%20%7C%20source-blue)](tools/server/README.md)
+
+> **一句话：关机、重启、换模型之后，4 万 token 的提示词不用重新预填充，首字时间从 155 秒降到 6 秒。**
+>
+> **In one line:** kill the server, reboot the box, reload the model — a 40K-token prompt
+> no longer re-runs prefill. **Time-to-first-token: ~155 s cold → ~6 s warm.**
+>
+> 原理是把 KV 缓存的前缀检查点（`.centry` 快照）持久化到磁盘，服务启动时自动恢复最长
+> 匹配的前缀。客户端不用改、协议不用变，服务自己记得上次算过什么。
+> The patch persists KV-cache prefix checkpoints to disk (`.centry` snapshots) and restores
+> the longest matching prefix on boot. No client changes — the server just remembers.
+
 ## 三步跑起来
 
 这是给第一次尝试的用户准备的最短路径。完整参数说明见
@@ -13,9 +28,12 @@
 
 - **Windows CUDA（NVIDIA）**：从 [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3) 下载
   `llama-server-win-cuda-v0.2.3.zip`，解压整个目录，不要只拿走 `.exe`。
-- **Linux / 其他后端**：下载源码后按 [构建说明](docs/build.md) 编译；本项目是
+- **Linux CUDA（NVIDIA）**：同一个 Release 里下载 `llama-server-linux-cuda-v0.2.3.tar.gz`，
+  该包为 `sm_61` / Pascal 编译，因此 GTX 10 系也能跑。
+- **AMD / Intel / Apple GPU**：本项目只提供 CUDA 预编译包，其他后端请下载源码按
+  [构建说明](docs/build.md) 编译。注意本项目是
   [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 `prism` 分支补丁，
-  不是 stock `ggml-org/llama.cpp` 二进制。
+  不是 stock `ggml-org/llama.cpp` 二进制——直接用官方二进制**不会**有缓存功能。
 - 只想使用 PrismML 官方预编译程序时，可从
   [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) 下载对应硬件的包；
   但请确认包内 server 已包含本项目的 persistent prompt disk cache 功能。
@@ -42,18 +60,47 @@ nvidia-smi
   -c 32768 -np 1 -ngl 99 -fa on `
   --fit `
   --slot-save-path D:\kvstore\model `
-  --prompt-cache-disk `
   --prompt-cache-disk-budget 20 `
   --checkpoint-min-step 2048 `
+  --ctx-checkpoints 64
+```
+
+Linux 示例：
+
+```bash
+# 确认 NVIDIA 驱动可用
+nvidia-smi
+
+tar xzf llama-server-linux-cuda-v0.2.3.tar.gz
+./llama-server \
+  -m /models/model.gguf \
+  --host 0.0.0.0 --port 8080 \
+  -c 32768 -np 1 -ngl 99 -fa on \
+  --fit \
+  --slot-save-path /var/tmp/kvstore/model \
+  --prompt-cache-disk-budget 20 \
+  --checkpoint-min-step 2048 \
   --ctx-checkpoints 64
 ```
 
 如果不想输入命令，使用压缩包里的 `start-llama-server.bat`。它会询问模型文件路径，
 自动使用压缩包目录旁的 `cache` 文件夹保存缓存。也可以继续手动使用上面的 PowerShell 命令。
 
-启用持久化缓存只需要 `--slot-save-path`（缓存保存位置）和 `--prompt-cache-disk`
-（打开磁盘缓存）。上面其他参数仅用于设置上下文、显卡、缓存容量和保存间隔；
-先照抄示例即可，其余 `--prompt-cache-disk-*` 和 checkpoint range 参数无需调整。
+### 到底需要哪些参数
+
+**唯一必须手写的是 `--slot-save-path`**（缓存保存到哪）。其余都有合理默认值：
+
+| 参数 | 必须？ | 说明 |
+|---|---|---|
+| `--slot-save-path` | **是** | 缓存根目录。`--prompt-cache-disk-budget`、`--prompt-cache-disk-path` 都挂在它下面，不给这个参数其它磁盘缓存参数一律无效。条目实际落在 `<该路径>/pdcache` |
+| `--prompt-cache-disk` | 否 | 磁盘缓存开关，**默认已开启**，写不写都行。想临时关掉用 `--no-prompt-cache-disk` |
+| `--prompt-cache-disk-budget` | 否 | 磁盘占用上限（GiB），默认 20，`0` 表示不限。超出后自动淘汰旧条目 |
+| `--prompt-cache-disk-path` | 否 | 想把条目放到别的目录时才用，默认 `<slot-save-path>/pdcache` |
+| `--prompt-cache-disk-namespace` | 否 | 在同一个根目录下按项目隔离子目录，多个项目共用一份缓存时用 |
+| `--checkpoint-min-step` | 否 | 每增长多少 token 存一次快照，默认 8192。对话分支多就调小（2048），更在意磁盘和内存开销就调大（4096） |
+| `--ctx-checkpoints` | 否 | 内存里最多保留多少个检查点，默认 32 |
+
+上面的示例命令把可调项都写出来了，方便你照抄后逐项调整；只看原理的话，记住 `--slot-save-path` 一个就够。
 
 看到下面的结果后，服务已经可以接受请求：
 
@@ -105,20 +152,57 @@ Invoke-RestMethod http://127.0.0.1:8080/completion `
 prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负责在重启或分支切换
 后恢复状态，仍然需要 `cache_prompt: true` 才会进入正常的前缀匹配流程。
 
-> [!NOTE]
-> **This repo's purpose: an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.**
->
+## 缓存什么时候会命中，什么时候不会
+
+这块最容易产生误解，先讲清楚：
+
+**会命中：**
+
+- 同一个 prompt **原样重发**，哪怕中间关了服务、重启了机器
+- 长对话持续增长：每次请求的 prompt = 旧对话 + 新增几条，历史部分直接复用，
+  只算新增的。上面表格里 40K 提示词只重算 32 个 token 就是这个场景
+- 服务重启后换了进程，但用同一个 `--slot-save-path`
+
+**不会命中：**
+
+- **prompt 前缀变了**。缓存只认「从第一个 token 开始的公共前缀」。如果你在最前面插了
+  一句 system prompt，后面全部错位，缓存等于没有。所以别把时间戳、随机 ID 之类
+  会变化的内容放在 prompt 最前面
+- **换了模型、上下文长度或 KV 类型**。检查点带配置签名，不匹配的条目会被安全忽略
+  （直接当没缓存，不会算错），换回来才会重新命中
+- **`cache_prompt: false`**，或者客户端自己在改写 prompt
+- 缓存目录被删了，或者 `--slot-save-path` 指向了别的位置
+
+**前缀一致性的实际做法：**把稳定内容（system prompt、工具定义、长文档）放在最前面，
+把每轮变化的内容（用户新消息、时间戳）放最后。opencode、Claude Code 这类 agent 客户端
+天然就是这个结构，所以开箱即用。
+
+**分支回退时更快：**对话分支（同一段历史换个方向继续）本来要从分叉点重算，
+有了磁盘检查点可以直接回退到内存里已有的检查点，不用从磁盘重读。
+
+## 实现位置
+
+核心代码在 `tools/server/server-prompt-disk.cpp`（约 900 行）加上 slot/task 的接入，
+完整参数语义见 [tools/server/README.md](tools/server/README.md)。
+补丁是相对 PrismML `prism` 分支的单个 commit：
+- **只想用现成的**：下 [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3) 的预编译包
+- **要改代码**：直接 clone 本仓库（`main` 是当前开发线），或在 `prism` 分支上 `git am`
+  [v0.1.0 补丁](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
+
+<details>
+<summary><b>English summary (what you get)</b></summary>
+
+> This repo is an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.
 > Long agentic sessions re-send the same growing conversation on every request. This patch
 > makes the server **persist the KV-cache prefix to disk and restore it automatically**, so a
 > restart (or a new process on the same prompt) skips the prefill it has already paid for.
 >
 > ```bash
 > llama-server -m model.gguf -c 32768 \
->   --slot-save-path D:/kvstore/mymodel \    # checkpoint directory (pdcache)
->   --checkpoint-min-step 4096 \              # save granularity: every 4096 tokens of growth
->   --ctx-checkpoints 64 \                    # max checkpoints kept in RAM
->   --prompt-cache-disk \                     # enable persistent disk snapshots
->   --prompt-cache-disk-budget 20             # disk budget in GB
+>   --slot-save-path D:/kvstore/mymodel \    # the only REQUIRED flag
+>   --checkpoint-min-step 4096 \
+>   --ctx-checkpoints 64 \
+>   --prompt-cache-disk-budget 20           # --prompt-cache-disk defaults to ON
 > ```
 >
 > What you get:
@@ -132,12 +216,11 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 >
 > Implementation lives in `tools/server/server-prompt-disk.cpp` (~900 lines) plus slot/task
 > integration; see [tools/server/README.md](tools/server/README.md) for the full flag
-> reference. The source is maintained on top of the
-> [PrismML `prism` branch](https://github.com/PrismML-Eng/llama.cpp/tree/prism); grab the
-> current source or binaries from the [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3).
-> Developers applying the patch can use the direct
-> [`v0.1.0` patch download](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
-> on top of the linked PrismML `prism` branch. `main` is the active development line.
+> reference. Prebuilt CUDA binaries (Windows + Linux) are on the
+> [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3);
+> `main` is the active development line.
+
+</details>
 
 ### NVIDIA 驱动要求
 
@@ -148,22 +231,35 @@ Linux package was built for CUDA `sm_61` / Pascal and also requires a compatible
 NVIDIA driver. A driver error during startup usually appears as `CUDA driver version is
 insufficient for CUDA runtime version`; this means the driver must be updated, not that
 the model or cache is broken.
->
-> 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
->
-> | | 冷算 Cold (no cache) | 命中 Full prefix hit |
-> |---|---|---|
-> | 预填充 Prefill 40K | ~151 s (265 tok/s) | 1.35 s (仅重算32个token / 32 tokens recomputed) |
-> | 解码 Decode | 24–28 tok/s | 22–28 tok/s（265个token全程稳定 / sustained over 265 tokens） |
-> | 端到端 End-to-end | ~155 s | ~6 s |
-> | 磁盘开销 Disk cost | 1.5 s 写入/write | 2.1 s 读取+解析+恢复（仅重启后首次 / first request after restart only）|
->
-> MoE分层经验 / MoE layering lesson（同一台机器 / same box）: 专家留GPU，KV跟层走。
-> Keep experts on GPU (`-ncmoe 0` + `--fit`), let KV follow the layers (hybrid模型不要加
-> `--no-kv-offload` — 40层里只有10层带KV / only 10 of 40 layers carry KV)。
-> 把20层MoE搬去CPU会直接崩：预填充掉到30 tok/s，解码掉到4 tok/s。
-> Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to 4 tok/s.
-> 混合模型禁用prefix-only / `--prompt-cache-disk-prefix-only` stays off for hybrid models.
+
+### 实测数据
+
+在 GTX 1080 8 GB + Qwen3.6-35B-A3B-NVFP4-Q4_K_M、`-c 92160`、4 万 token 智能体提示词下测得：
+
+| | 冷算（无缓存） | 命中 |
+|---|---|---|
+| 预填充 40K | ~151 s（265 tok/s） | 1.35 s（仅重算 32 个 token） |
+| 解码 | 24–28 tok/s | 22–28 tok/s（265 个 token 全程稳定） |
+| 端到端 | ~155 s | ~6 s |
+| 磁盘开销 | 1.5 s 写入 | 2.1 s 读取+解析+恢复（仅重启后首次） |
+
+英文对照 / in English:
+
+| | Cold (no cache) | Full prefix hit |
+|---|---|---|
+| Prefill 40K | ~151 s (265 tok/s) | 1.35 s (32 tokens recomputed) |
+| Decode | 24–28 tok/s | 22–28 tok/s (sustained over 265 tokens) |
+| End-to-end | ~155 s | ~6 s |
+| Disk cost | 1.5 s write | 2.1 s read + parse + restore (first request after restart only) |
+
+**MoE 分层经验**：专家留 GPU，KV 跟层走。保持 `-ncmoe 0` + `--fit`，hybrid 模型不要加
+`--no-kv-offload`（40 层里只有 10 层带 KV）。把 20 层 MoE 搬去 CPU 会直接崩：
+预填充掉到 30 tok/s，解码掉到 4 tok/s。混合模型保持 prefix-only 关闭。
+
+**MoE layering lesson** (same box): keep experts on GPU (`-ncmoe 0` + `--fit`), let KV
+follow the layers (hybrid models must not add `--no-kv-offload` — only 10 of 40 layers
+carry KV). Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to
+4 tok/s. Keep `--prompt-cache-disk-prefix-only` off for hybrid models.
 
 ## NVIDIA RTX 30/40/50 系列配置指南
 
@@ -251,9 +347,14 @@ prompt cache = ... reused ... recomputed
 如果该配置显存不足，依次尝试 `-ncmoe 1`、`2`、`4`，直到启动稳定；不要把 GTX 1080 的 `-ncmoe 23` 作为新显卡默认参数。
 
 > [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
+> **This is the PrismML fork of llama.cpp** (branch `prism`), the main line behind the
+> [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models. It tracks current
+> mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
+> **New here? Start with [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo)** — it
+> picks the right models and prebuilt binaries for your hardware/backend automatically.
 >
-> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
+> <details>
+> <summary><b>三元模型文件怎么选 / which model file to use（仅本 fork 相关）</b></summary>
 >
 > **Which ternary model file to use:**
 >
@@ -264,6 +365,8 @@ prompt cache = ... reused ... recomputed
 > **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+>
+> </details>
 
 ---
 
