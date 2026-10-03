@@ -5,7 +5,10 @@
 [![Patch](https://img.shields.io/badge/patch-single%20commit-orange)](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
 
 > [!NOTE]
-> **This repo's purpose: an experimental persistent prompt-prefix cache for the PrismML llama.cpp fork.**
+> **This repo's purpose: a restart-proof persistent prompt-prefix cache for the PrismML llama.cpp fork.**
+> Kill the server, reboot the box, reload the model — the next request on the same prompt
+> restores the KV cache from disk instead of re-running prefill. **Time-to-first-token on a
+> 40K-token prompt: ~155 s cold → ~6 s warm.**
 >
 > Long agentic sessions re-send the same growing conversation on every request. This patch
 > makes the server **persist the KV-cache prefix to disk and restore it automatically**, so a
