@@ -42,6 +42,23 @@
 > curl -sL https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch -o pdcache.patch
 > ```
 >
+> No build? Grab the prebuilt Windows CUDA server from [v0.2.1](../../releases/tag/v0.2.1),
+> then run it — three steps, no client changes needed (`cache_prompt` defaults to `true`):
+>
+> ```bat
+> llama-server.exe -m model.gguf -c 32768 --port 8000 ^
+>   --slot-save-path D:/kvstore/mymodel --prompt-cache-disk ^
+>   --checkpoint-min-step 4096 --ctx-checkpoints 64 --prompt-cache-disk-budget 20
+> ```
+>
+> ```bash
+> curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+>   -d '{"model":"mymodel","messages":[{"role":"user","content":"hello"}]}'
+> ```
+>
+> Watch the server log: `prompt disk: restored N prompt tokens to device` means the restart
+> was skipped; `prompt cache = total / reused / recomputed` tells you how much prefill you saved.
+>
 > 实测 / Measured on GTX 1080 8 GB, Qwen3.6-35B-A3B-NVFP4-Q4_K_M, `-c 92160`, 40K-token agentic prompt（4万token智能体提示词）:
 >
 > | | 冷算 Cold (no cache) | 命中 Full prefix hit |
