@@ -38,6 +38,11 @@ Windows PowerShell 示例（路径按本机修改）：
   --ctx-checkpoints 64
 ```
 
+这几个参数已经足够启用持久化缓存：`--slot-save-path` 指定缓存位置，
+`--prompt-cache-disk` 启用磁盘快照；其余参数只是预算和 checkpoint 颗粒度调优，
+不改也能使用默认值。先按这条命令跑通，其他 `--prompt-cache-disk-*`、
+`--ctx-checkpoints` 和 checkpoint range 参数都可以以后再调。
+
 看到下面的结果后，服务已经可以接受请求：
 
 ```text
@@ -113,8 +118,9 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 > reference. The source is maintained on top of the
 > [PrismML `prism` branch](https://github.com/PrismML-Eng/llama.cpp/tree/prism); grab the
 > current source or binaries from the [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2).
-> The older [persistent-prompt-cache branch](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/tree/prism-persistent-prompt-cache)
-> is retained for historical release work; `main` is the active development line.
+> Developers applying the patch can use the direct
+> [`v0.1.0` patch download](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
+> on top of the linked PrismML `prism` branch. `main` is the active development line.
 
 ### NVIDIA 驱动要求
 
