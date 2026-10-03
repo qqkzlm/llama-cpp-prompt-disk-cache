@@ -16,11 +16,20 @@
 >
 > ```bash
 > llama-server -m model.gguf -c 32768 \
->   --slot-save-path D:/kvstore/mymodel \    # checkpoint directory (pdcache)
+>   --slot-save-path D:/kvstore/mymodel \    # REQUIRED: cache root; budget/path hang off this
 >   --checkpoint-min-step 4096 \              # save granularity: every 4096 tokens of growth
 >   --ctx-checkpoints 64 \                    # max checkpoints kept in RAM
->   --prompt-cache-disk-budget 20             # disk budget in GB
+>   --prompt-cache-disk-budget 20             # disk budget in GB (0 = no limit)
 > ```
+>
+> Flag notes:
+> - `--slot-save-path` is the **only required flag** — `--prompt-cache-disk-budget` and
+>   `--prompt-cache-disk-path` are ignored without it. Entries land in `<path>/pdcache`.
+> - `--prompt-cache-disk` is **enabled by default**; you never need to pass it. Pass
+>   `--no-prompt-cache-disk` to turn the cache off.
+> - `--prompt-cache-disk-path` is only for putting entries somewhere else (default:
+>   `<slot-save-path>/pdcache`). `--prompt-cache-disk-namespace NAME` isolates several
+>   projects inside one root.
 >
 > What you get:
 > - **Session restore across restarts** — on boot the newest checkpoint for the matching
@@ -42,12 +51,21 @@
 > curl -sL https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch -o pdcache.patch
 > ```
 >
-> No build? Grab the prebuilt Windows CUDA server from [v0.2.1](../../releases/tag/v0.2.1),
-> then run it — three steps, no client changes needed (`cache_prompt` defaults to `true`):
+> No build? Grab a prebuilt CUDA server from the newest release — **Windows**
+> ([`llama-server-win-cuda-v0.2.3.zip`](../../releases/tag/v0.2.3)) or **Linux**
+> ([`llama-server-linux-cuda-v0.2.3.tar.gz`](../../releases/tag/v0.2.3)), then run it.
+> Three steps, no client changes needed:
 >
 > ```bat
 > llama-server.exe -m model.gguf -c 32768 --port 8000 ^
->   --slot-save-path D:/kvstore/mymodel --prompt-cache-disk ^
+>   --slot-save-path D:/kvstore/mymodel ^
+>   --checkpoint-min-step 4096 --ctx-checkpoints 64 --prompt-cache-disk-budget 20
+> ```
+>
+> ```bash
+> tar xzf llama-server-linux-cuda-v0.2.3.tar.gz
+> ./llama-server -m model.gguf -c 32768 --host 0.0.0.0 --port 8000 \
+>   --slot-save-path /var/tmp/kvstore/mymodel \
 >   --checkpoint-min-step 4096 --ctx-checkpoints 64 --prompt-cache-disk-budget 20
 > ```
 >
@@ -68,17 +86,24 @@
 > | 端到端 End-to-end | ~155 s | ~6 s |
 > | 磁盘开销 Disk cost | 1.5 s 写入/write | 2.1 s 读取+解析+恢复（仅重启后首次 / first request after restart only）|
 >
-> MoE分层经验 / MoE layering lesson（同一台机器 / same box）: 专家留GPU，KV跟层走。
-> Keep experts on GPU (`-ncmoe 0` + `--fit`), let KV follow the layers (hybrid模型不要加
-> `--no-kv-offload` — 40层里只有10层带KV / only 10 of 40 layers carry KV)。
-> 把20层MoE搬去CPU会直接崩：预填充掉到30 tok/s，解码掉到4 tok/s。
-> Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to 4 tok/s.
-> 混合模型禁用prefix-only / `--prompt-cache-disk-prefix-only` stays off for hybrid models.
-
-> [!IMPORTANT]
-> **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
+> **MoE 分层经验**（同一台机器）：专家留 GPU，KV 跟层走。保持 `-ncmoe 0` + `--fit`，
+> hybrid 模型不要加 `--no-kv-offload`（40 层里只有 10 层带 KV）。把 20 层 MoE 搬去 CPU
+> 会直接崩：预填充掉到 30 tok/s，解码掉到 4 tok/s。混合模型保持 prefix-only 关闭。
 >
-> **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
+> **MoE layering lesson** (same box): keep experts on GPU (`-ncmoe 0` + `--fit`), let KV
+> follow the layers (hybrid models must not add `--no-kv-offload` — only 10 of 40 layers
+> carry KV). Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to
+> 4 tok/s. Keep `--prompt-cache-disk-prefix-only` off for hybrid models.
+>
+> [!IMPORTANT]
+> **This is the PrismML fork of llama.cpp** (branch `prism`), the main line behind the
+> [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models. It tracks current
+> mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
+> **New here? Start with [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo)** — it
+> picks the right models and prebuilt binaries for your hardware/backend automatically.
+>
+> <details>
+> <summary><b>Which model file / format details (only relevant on this fork)</b></summary>
 >
 > **Which ternary model file to use:**
 >
@@ -89,6 +114,8 @@
 > **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+>
+> </details>
 
 ---
 
