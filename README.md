@@ -6,13 +6,13 @@
 [server 文档](tools/server/README.md)。
 
 > **适用范围：**下面的直接下载包是 NVIDIA CUDA 版本，适用于 Windows 和 Linux。
-> 它不包含模型，也不适用于 AMD/Intel/Apple GPU。第一次使用时不要双击
-> `llama-server.exe`；请在解压后的目录打开 PowerShell，让错误信息留在窗口里。
+> 它不包含模型，也不适用于 AMD/Intel/Apple GPU。Windows 用户可以双击压缩包里的
+> `start-llama-server.bat` 自动检查显卡、询问模型路径并启动；需要自定义参数时再用下方命令。
 
 ### 1. 下载带缓存功能的 server
 
-- **Windows CUDA（NVIDIA）**：从 [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2) 下载
-  `llama-server-win-cuda-v0.2.2.zip`，解压整个目录，不要只拿走 `.exe`。
+- **Windows CUDA（NVIDIA）**：从 [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3) 下载
+  `llama-server-win-cuda-v0.2.3.zip`，解压整个目录，不要只拿走 `.exe`。
 - **Linux / 其他后端**：下载源码后按 [构建说明](docs/build.md) 编译；本项目是
   [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) 的 `prism` 分支补丁，
   不是 stock `ggml-org/llama.cpp` 二进制。
@@ -48,10 +48,12 @@ nvidia-smi
   --ctx-checkpoints 64
 ```
 
-这几个参数已经足够启用持久化缓存：`--slot-save-path` 指定缓存位置，
-`--prompt-cache-disk` 启用磁盘快照；其余参数只是预算和 checkpoint 颗粒度调优，
-不改也能使用默认值。先按这条命令跑通，其他 `--prompt-cache-disk-*`、
-`--ctx-checkpoints` 和 checkpoint range 参数都可以以后再调。
+如果不想输入命令，使用压缩包里的 `start-llama-server.bat`。它会询问模型文件路径，
+自动使用压缩包目录旁的 `cache` 文件夹保存缓存。也可以继续手动使用上面的 PowerShell 命令。
+
+启用持久化缓存只需要 `--slot-save-path`（缓存保存位置）和 `--prompt-cache-disk`
+（打开磁盘缓存）。上面其他参数仅用于设置上下文、显卡、缓存容量和保存间隔；
+先照抄示例即可，其余 `--prompt-cache-disk-*` 和 checkpoint range 参数无需调整。
 
 看到下面的结果后，服务已经可以接受请求：
 
@@ -132,14 +134,14 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 > integration; see [tools/server/README.md](tools/server/README.md) for the full flag
 > reference. The source is maintained on top of the
 > [PrismML `prism` branch](https://github.com/PrismML-Eng/llama.cpp/tree/prism); grab the
-> current source or binaries from the [v0.2.2 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.2).
+> current source or binaries from the [v0.2.3 Release](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/tag/v0.2.3).
 > Developers applying the patch can use the direct
 > [`v0.1.0` patch download](https://github.com/qqkzlm/llama-cpp-prompt-disk-cache/releases/download/v0.1.0/0001-feat-server-add-persistent-prompt-disk-cache.patch)
 > on top of the linked PrismML `prism` branch. `main` is the active development line.
 
 ### NVIDIA 驱动要求
 
-The v0.2.2 CUDA packages require an NVIDIA driver that supports CUDA 12.0 or newer.
+The v0.2.3 CUDA packages require an NVIDIA driver that supports CUDA 12.0 or newer.
 Before starting, run `nvidia-smi` and update the driver if the command fails or reports
 an older driver. The Windows package needs a Windows R525-class-or-newer driver; the
 Linux package was built for CUDA `sm_61` / Pascal and also requires a compatible Linux

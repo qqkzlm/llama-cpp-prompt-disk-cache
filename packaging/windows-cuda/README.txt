@@ -1,10 +1,10 @@
-llama.cpp Persistent Prompt Disk Cache - Windows CUDA v0.2.2
+llama.cpp Persistent Prompt Disk Cache - Windows CUDA v0.2.3
 
 1. 解压整个压缩包，不要单独移动 EXE 或 DLL。
 2. 把启动命令里的 model.gguf 改成你的 GGUF 模型路径。
-3. 在本目录打开 PowerShell，先运行 nvidia-smi，再运行 llama-server.exe；无需安装 CUDA Toolkit。
+3. 双击 start-llama-server.bat；它会检查 nvidia-smi、询问模型路径并自动启动；无需安装 CUDA Toolkit。
 
-示例：
+也可以手动在本目录打开 PowerShell，运行：
 llama-server.exe -m model.gguf -c 32768 --port 8000 --slot-save-path D:/kvstore/mymodel --prompt-cache-disk --checkpoint-min-step 4096 --ctx-checkpoints 64 --prompt-cache-disk-budget 20
 
 需要 NVIDIA 驱动支持 CUDA 12.0 或更高版本。如果 nvidia-smi 失败，或提示
