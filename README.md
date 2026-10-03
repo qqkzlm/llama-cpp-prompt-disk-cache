@@ -45,6 +45,91 @@
 > Pushing 20 MoE layers to CPU collapsed prefill to 30 tok/s and decode to 4 tok/s.
 > 混合模型禁用prefix-only / `--prompt-cache-disk-prefix-only` stays off for hybrid models.
 
+## NVIDIA RTX 30/40/50 系列配置指南
+
+下面的配置适用于 CUDA 构建和混合 MoE 模型。`-ncmoe` 没有跨显卡的固定最佳值：它表示放到 CPU 的 MoE 专家层数，数值越大通常越省显存，但会降低速度。先用 GPU KV 跑通，再根据显存余量调整。
+
+### 推荐起点
+
+RTX 30/40/50 系列优先从下面的配置开始：
+
+```text
+-ngl 99
+-ncmoe 0
+-c 32768                 # 按需要改成 90112 或其他上下文长度
+-np 1
+-fa on
+-ctk q8_0
+-ctv q8_0
+--fit
+--ctx-checkpoints 64
+--prompt-cache-disk
+--slot-save-path D:\ai\kvstore\apex-ranges
+```
+
+混合模型默认不要加 `--no-kv-offload`。GPU KV 通常比 CPU KV 快很多；只有显存确实不够启动，或长上下文导致显存不足时，才考虑 CPU KV。
+
+### 按显存调整 `-ncmoe`
+
+推荐用阶梯方式测试，而不是直接套用另一台机器的值：
+
+```text
+-ncmoe 0  # 首选：专家和 KV 尽量留在 GPU
+-ncmoe 1
+-ncmoe 2
+-ncmoe 4
+-ncmoe 8
+```
+
+每次只增加一个档位，并记录启动后的显存和生成速度。出现 OOM、启动失败或 decode 明显下降时，退回上一个档位。当前 GTX 1080 上使用的 `-ncmoe 23` 是 8 GB 显存的特殊折中值，不应直接用于 RTX 30/40/50 系列。
+
+经验上，显存更大的卡应先尝试 `-ncmoe 0`；同一显存下，RTX 40/50 系列通常比 RTX 30 系列有更大的速度余量，但最终结果仍取决于模型量化、上下文长度、KV 类型和 batch 参数。
+
+### 一套可复现的速度测试
+
+保持模型、prompt、`-c`、`-b`、`-ub` 和生成长度不变，只修改 `-ncmoe` 或是否使用 `--no-kv-offload`：
+
+```powershell
+$body = @{ prompt = ("Benchmark text: " + (("The quick brown fox tests MoE inference speed. ") * 180)); n_predict = 128; temperature = 0.2; ignore_eos = $true } | ConvertTo-Json -Compress
+Invoke-RestMethod http://127.0.0.1:8000/completion -Method Post `
+  -Headers @{ Authorization = "Bearer YOUR_KEY"; "Content-Type" = "application/json" } `
+  -Body $body
+```
+
+比较日志中的：
+
+```text
+prompt eval time ... tokens per second
+eval time ... tokens per second
+prompt cache = ... reused ... recomputed
+```
+
+选配置时优先看 `eval time` 的持续 token/s，其次看显存余量和服务稳定性。第一次请求可能是冷算；速度比较至少应使用相同 prompt 重复一次，并区分 prompt prefill 和 decode。
+
+### 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 启动 OOM | 增大 `-ncmoe`，或降低 `-c`；不要先关闭 GPU KV |
+| 吐字突然变慢 | 检查是否加了 `--no-kv-offload`，并比较 GPU 利用率和 `eval time` |
+| 显存还有余量但速度低 | 从更小的 `-ncmoe` 重新测试，专家留 CPU 会增加 PCIe/CPU 路径开销 |
+| 长 prompt 每次都冷算 | 检查 prompt 前缀是否一致、`--slot-save-path` 是否相同、缓存目录是否可写 |
+| 缓存目录被删除 | 当前版本会在后台写入前自动重建目录；被删除的旧快照无法恢复，需要重新写入 |
+| 缓存显示配置不匹配 | 模型、上下文长度或 KV 类型变化会使旧条目被安全忽略 |
+
+完整的 90K 上下文示例：
+
+```text
+-ngl 99 -ncmoe 0 -c 90112 -np 1 -fa on -ctk q8_0 -ctv q8_0
+--fit --ctx-checkpoints 64
+--checkpoint-range1-end 30000 --checkpoint-range1-step 1000
+--checkpoint-range2-end 40000 --checkpoint-range2-step 256
+--checkpoint-range3-step 4096
+--slot-save-path D:\ai\kvstore\apex-ranges --prompt-cache-disk
+```
+
+如果该配置显存不足，依次尝试 `-ncmoe 1`、`2`、`4`，直到启动稳定；不要把 GTX 1080 的 `-ncmoe 23` 作为新显卡默认参数。
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
