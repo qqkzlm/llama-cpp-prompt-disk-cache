@@ -3620,6 +3620,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--prompt-cache-disk-budget"}, "N",
         "on-disk prompt cache budget in GiB, 0 = no limit (default: 20, needs --slot-save-path)",
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-cache-disk-budget must be non-negative");
+            }
             params.prompt_cache_disk_budget_gb = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_BUDGET"));
@@ -3627,6 +3630,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--prompt-cache-disk-min-tokens"}, "N",
         "skip on-disk prompt cache entries shorter than this many tokens (default: 1024)",
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("prompt-cache-disk-min-tokens must be non-negative");
+            }
             params.prompt_cache_disk_min_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_MIN_TOKENS"));

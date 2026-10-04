@@ -753,17 +753,25 @@ void server_prompt_disk::write_entry(const queue_item & item) const {
         for (auto it = index.begin(); it != index.end(); ++it) {
             auto & e = *it;
             if (e.hash == h && e.path == path) {
-                // exact duplicate, refresh LRU time (file + index row) and skip
+                // Exact duplicate, refresh LRU time (file + index row) and skip.
+                // An entry with the same model/token hash can still belong to a
+                // different configuration (n_ctx, KV types, build, ...). Such
+                // entries are indexed as unusable during scan and must be
+                // replaced instead of blocking the new snapshot indefinitely.
                 std::error_code ec;
-                if (fs::exists(path, ec) && !ec) {
+                if (e.usable && fs::exists(path, ec) && !ec) {
                     const auto now = fs::file_time_type::clock::now();
                     fs::last_write_time(path, now, ec);
                     e.mtime = now;
                     return;
                 }
 
-                // The file was removed externally.  Drop the stale index row
-                // so the newly written snapshot is accepted below.
+                // The file was removed externally, or is an incompatible old
+                // entry. Drop the stale index row and file so the newly written
+                // snapshot is accepted below (including on Windows, where
+                // rename() cannot replace an existing target).
+                std::error_code ec_remove;
+                fs::remove(path, ec_remove);
                 index_bytes -= e.bytes;
                 index.erase(it);
                 break;

@@ -125,6 +125,14 @@ static void test(void) {
     argv = {"binary_name", "-ngl", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // prompt disk cache numeric options must not accept negative values that
+    // would later be converted to unsigned sizes.
+    argv = {"binary_name", "--prompt-cache-disk-budget", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    argv = {"binary_name", "--prompt-cache-disk-min-tokens", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
     // wrong value (enum)
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
