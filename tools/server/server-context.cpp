@@ -1300,7 +1300,10 @@ private:
             } else if (!params_base.slot_save_path.empty()) {
                 disk_dir = params_base.slot_save_path + "pdcache" + std::string(1, DIRECTORY_SEPARATOR);
             } else {
-                disk_dir = std::string(".") + std::string(1, DIRECTORY_SEPARATOR) + "pdcache" + std::string(1, DIRECTORY_SEPARATOR);
+                // no path configured: pick the volume with the most free space so the
+                // cache works out of the box instead of landing in the process CWD
+                // (which on Windows is often an unwritable install directory).
+                disk_dir = server_prompt_disk_autodir();
             }
             if (params_base.prompt_cache_disk_prefix_only) {
                 disk_dir += "prefix-only" + std::string(1, DIRECTORY_SEPARATOR);
@@ -1333,8 +1336,16 @@ private:
                 prompt_disk->scan();
                 prompt_cache->set_disk(prompt_disk.get());
                 prompt_cache->disk_prefix_only = params_base.prompt_cache_disk_prefix_only;
-                SRV_INF("prompt disk cache enabled: %s\n", disk_dir.c_str());
+                SRV_INF("prompt disk cache enabled: %s (budget: %d GiB)\n",
+                        disk_dir.c_str(), params_base.prompt_cache_disk_budget_gb);
             }
+        } else if (params_base.prompt_cache_disk && !prompt_cache) {
+            SRV_WRN("%s", "prompt disk cache requested but the in-RAM prompt cache is disabled (`--cache-ram 0`); no disk cache will be used");
+        } else if (params_base.prompt_cache_disk &&
+                   params_base.prompt_cache_disk_path.empty() &&
+                   params_base.slot_save_path.empty() &&
+                   server_prompt_disk_autodir().empty()) {
+            SRV_WRN("%s", "prompt disk cache enabled but no usable volume was found; set --prompt-cache-disk-path explicitly to enable it");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1630,13 +1641,17 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // Loading is independent from saving the previous slot. After a
+            // restart the slot is empty: lookup_cache is true but
+            // save_previous_slot is false, so disk restore must be separate.
+            if (lookup_cache) {
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
-
                 prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
 
             // (single prompt_load above already performs both the RAM and the

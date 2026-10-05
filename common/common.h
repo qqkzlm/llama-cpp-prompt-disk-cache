@@ -685,10 +685,10 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    int prompt_cache_disk_budget_gb = 20;   // on-disk prompt cache budget, 0 = no limit
+    int prompt_cache_disk_budget_gb = 100;  // on-disk prompt cache budget, 0 = no limit
     int prompt_cache_disk_min_tokens = 1024; // skip prompts shorter than this
     int prompt_cache_disk_checkpoints = 8;    // retain only newest checkpoints per disk entry
-    std::string prompt_cache_disk_path = ""; // on-disk prompt cache dir (default: <slot-save-path>/pdcache)
+    std::string prompt_cache_disk_path = ""; // on-disk prompt cache dir (default: <slot-save-path>/pdcache, else <freest-volume>/llama-pdcache)
     std::string prompt_cache_disk_namespace = ""; // optional project/session namespace below the cache root
     bool prompt_cache_disk = true;           // on-disk prompt cache master switch (default: on)
     bool prompt_cache_disk_prefix_only = false;

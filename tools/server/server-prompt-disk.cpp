@@ -19,6 +19,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #endif
 
@@ -26,6 +27,98 @@ namespace fs = std::filesystem;
 
 static const uint32_t PDC_MAGIC = 0x4543504c; // "LPCE"
 static const uint32_t PDC_VER = 3;
+
+// ---- default cache volume selection -------------------------------------------
+
+// free bytes available to the current user on the volume rooted at `root`.
+// returns false when the volume cannot be queried at all.
+static bool server_prompt_disk_free_bytes(const std::string & root, uint64_t & out_free) {
+#ifdef _WIN32
+    // prefer the per-user quota: a plain GetDiskFreeSpaceEx reports the volume total,
+    // which overstates what a standard user can actually write.
+    const std::wstring wroot(root.begin(), root.end());
+    ULARGE_INTEGER avail_user = {};
+    if (GetDiskFreeSpaceExW(wroot.c_str(), &avail_user, nullptr, nullptr) && avail_user.QuadPart > 0) {
+        out_free = (uint64_t) avail_user.QuadPart;
+        return true;
+    }
+    ULARGE_INTEGER avail = {};
+    if (!GetDiskFreeSpaceExW(wroot.c_str(), &avail, nullptr, nullptr)) {
+        return false;
+    }
+    out_free = (uint64_t) avail.QuadPart;
+    return out_free > 0;
+#else
+    struct statvfs vfs = {};
+    if (statvfs(root.c_str(), &vfs) != 0) {
+        return false;
+    }
+    // f_bavail is what an unprivileged user may use; f_bfree includes the root reserve.
+    out_free = (uint64_t) vfs.f_bavail * (uint64_t) vfs.f_frsize;
+    return out_free > 0;
+#endif
+}
+
+std::string server_prompt_disk_autodir() {
+    const std::string leaf = "llama-pdcache";
+
+    std::string best_dir;
+    uint64_t best_free = 0;
+
+    auto consider = [&](const std::string & root) {
+        uint64_t free_bytes = 0;
+        if (!server_prompt_disk_free_bytes(root, free_bytes)) {
+            return;
+        }
+        if (free_bytes > best_free) {
+            best_free = free_bytes;
+            best_dir = root;
+        }
+    };
+
+#ifdef _WIN32
+    DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (1u << i)) == 0) {
+            continue;
+        }
+        consider(std::string(1, (char) ('A' + i)) + ":" + std::string(1, DIRECTORY_SEPARATOR));
+    }
+#else
+    // only consider real, mounted filesystems: /proc and /sys style pseudo-filesystems
+    // report little or no free space and would otherwise distort the comparison.
+    std::ifstream mounts("/proc/mounts");
+    std::string line;
+    while (std::getline(mounts, line)) {
+        std::istringstream iss(line);
+        std::string dev, mount, fstype, opts;
+        if (!(iss >> dev >> mount >> fstype >> opts)) {
+            continue;
+        }
+        if (fstype == "proc" || fstype == "sysfs" || fstype == "devtmpfs" ||
+            fstype == "devpts" || fstype == "cgroup" || fstype == "cgroup2" ||
+            fstype == "securityfs" || fstype == "pstore" || fstype == "debugfs" ||
+            fstype == "tracefs" || fstype == "mqueue" || fstype == "hugetlbfs" ||
+            fstype == "configfs" || fstype == "fusectl" || fstype == "bpf" ||
+            fstype == "binfmt_misc" || fstype == "autofs" || fstype == "squashfs" ||
+            fstype == "ramfs" || fstype == "overlay" || fstype == "tmpfs" || fstype == "nsfs") {
+            continue;
+        }
+        std::error_code sec;
+        if (!fs::is_directory(mount, sec) || sec) {
+            continue;
+        }
+        consider(mount);
+    }
+    // always include / as a last-resort candidate
+    consider("/");
+#endif
+
+    if (best_dir.empty()) {
+        return std::string();
+    }
+    return best_dir + leaf + std::string(1, DIRECTORY_SEPARATOR);
+}
 
 std::string server_prompt_file_fingerprint(const std::string & path) {
     std::error_code ec;

@@ -17,6 +17,12 @@ uint64_t server_prompt_disk_hash(const llama_tokens & tokens);
 
 std::string server_prompt_file_fingerprint(const std::string & path);
 
+// Default cache location when neither --prompt-cache-disk-path nor --slot-save-path is
+// given: <dir>/llama-pdcache on the volume with the most free space for the current user
+// (largest total free space if the user-quota query is unavailable). Returns an empty
+// string only if every volume could not be queried.
+std::string server_prompt_disk_autodir();
+
 // guards: a disk entry is usable only when all of these match the running server
 struct server_prompt_disk_guard {
     std::string model_fingerprint;

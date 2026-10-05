@@ -3618,7 +3618,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--prompt-cache-disk-budget"}, "N",
-        "on-disk prompt cache budget in GiB, 0 = no limit (default: 20, needs --slot-save-path)",
+        "on-disk prompt cache budget in GiB, 0 = no limit (default: 100)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("prompt-cache-disk-budget must be non-negative");
@@ -3659,7 +3659,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_CACHE_DISK_CHECKPOINTS"));
     add_opt(common_arg(
         {"--prompt-cache-disk-path"}, "PATH",
-        "on-disk prompt cache directory (default: <slot-save-path>/pdcache, needs --slot-save-path)",
+        "on-disk prompt cache directory (default: <slot-save-path>/pdcache, else "
+        "<volume-with-most-free-space>/llama-pdcache)",
         [](common_params & params, const std::string & value) {
             params.prompt_cache_disk_path = value;
             // if doesn't end with DIRECTORY_SEPARATOR, add it

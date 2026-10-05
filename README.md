@@ -60,7 +60,7 @@ nvidia-smi
   -c 32768 -np 1 -ngl 99 -fa on `
   --fit `
   --slot-save-path D:\kvstore\model `
-  --prompt-cache-disk-budget 20 `
+  --prompt-cache-disk-budget 100 `
   --checkpoint-min-step 2048 `
   --ctx-checkpoints 64
 ```
@@ -78,7 +78,7 @@ tar xzf llama-server-linux-cuda-v0.2.3.tar.gz
   -c 32768 -np 1 -ngl 99 -fa on \
   --fit \
   --slot-save-path /var/tmp/kvstore/model \
-  --prompt-cache-disk-budget 20 \
+  --prompt-cache-disk-budget 100 \
   --checkpoint-min-step 2048 \
   --ctx-checkpoints 64
 ```
@@ -88,19 +88,22 @@ tar xzf llama-server-linux-cuda-v0.2.3.tar.gz
 
 ### 到底需要哪些参数
 
-**唯一必须手写的是 `--slot-save-path`**（缓存保存到哪）。其余都有合理默认值：
+**不传任何缓存路径也能直接工作。**服务默认自动选择空闲空间最大的磁盘，创建
+`llama-pdcache` 目录，并使用 100 GiB 磁盘预算。想固定位置时再手写
+`--slot-save-path` 或 `--prompt-cache-disk-path`。其余参数都有合理默认值：
 
 | 参数 | 必须？ | 说明 |
 |---|---|---|
-| `--slot-save-path` | **是** | 缓存根目录。`--prompt-cache-disk-budget`、`--prompt-cache-disk-path` 都挂在它下面，不给这个参数其它磁盘缓存参数一律无效。条目实际落在 `<该路径>/pdcache` |
+| `--slot-save-path` | 否 | 固定缓存根目录；不指定时自动选择空闲空间最大的磁盘，使用 `<磁盘>/llama-pdcache` |
 | `--prompt-cache-disk` | 否 | 磁盘缓存开关，**默认已开启**，写不写都行。想临时关掉用 `--no-prompt-cache-disk` |
-| `--prompt-cache-disk-budget` | 否 | 磁盘占用上限（GiB），默认 20，`0` 表示不限。超出后自动淘汰旧条目 |
-| `--prompt-cache-disk-path` | 否 | 想把条目放到别的目录时才用，默认 `<slot-save-path>/pdcache` |
+| `--prompt-cache-disk-budget` | 否 | 磁盘占用上限（GiB），默认 **100**，`0` 表示不限。超出后自动淘汰旧条目 |
+| `--prompt-cache-disk-path` | 否 | 想把条目放到别的目录时才用；它的优先级高于自动选盘和 `--slot-save-path` |
 | `--prompt-cache-disk-namespace` | 否 | 在同一个根目录下按项目隔离子目录，多个项目共用一份缓存时用 |
 | `--checkpoint-min-step` | 否 | 每增长多少 token 存一次快照，默认 8192。对话分支多就调小（2048），更在意磁盘和内存开销就调大（4096） |
 | `--ctx-checkpoints` | 否 | 内存里最多保留多少个检查点，默认 32 |
 
-上面的示例命令把可调项都写出来了，方便你照抄后逐项调整；只看原理的话，记住 `--slot-save-path` 一个就够。
+上面的示例命令把可调项都写出来了，方便你照抄后逐项调整；只想开缓存的话，**一个缓存路径参数都不用写**。
+启动日志会打印实际目录，例如：`prompt disk cache enabled: D:\llama-pdcache\ (budget: 100 GiB)`。
 
 看到下面的结果后，服务已经可以接受请求：
 
@@ -202,7 +205,7 @@ prompt token 数；`predicted_per_second` 是吐字速度。磁盘缓存只负�
 >   --slot-save-path D:/kvstore/mymodel \    # the only REQUIRED flag
 >   --checkpoint-min-step 4096 \
 >   --ctx-checkpoints 64 \
->   --prompt-cache-disk-budget 20           # --prompt-cache-disk defaults to ON
+>   --prompt-cache-disk-budget 100          # --prompt-cache-disk defaults to ON
 > ```
 >
 > What you get:
